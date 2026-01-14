@@ -3289,6 +3289,21 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     return Ok(None);
                 };
 
+                // Emit SSE events for reconstructed columns.
+                // Note: We emit events directly rather than using emit_sse_data_column_sidecar_events
+                // because the reconstructed columns are already added to the cache by the DA checker,
+                // and emit_sse_data_column_sidecar_events filters out already-cached columns.
+                // The returned data_columns_to_publish are guaranteed to be newly reconstructed.
+                if let Some(event_handler) = self.event_handler.as_ref()
+                    && event_handler.has_data_column_sidecar_subscribers()
+                {
+                    for data_column in &data_columns_to_publish {
+                        event_handler.register(EventKind::DataColumnSidecar(
+                            SseDataColumnSidecar::from_data_column_sidecar(data_column),
+                        ));
+                    }
+                }
+
                 self.process_availability(slot, availability, || Ok(()))
                     .await
                     .map(|availability_processing_status| {

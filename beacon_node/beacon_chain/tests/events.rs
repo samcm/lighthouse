@@ -1,13 +1,17 @@
 use beacon_chain::blob_verification::GossipVerifiedBlob;
-use beacon_chain::data_column_verification::GossipVerifiedDataColumn;
+use beacon_chain::custody_context::NodeCustodyType;
+use beacon_chain::data_column_verification::{
+    CustodyDataColumn, GossipVerifiedDataColumn, KzgVerifiedCustodyDataColumn,
+};
 use beacon_chain::test_utils::{BeaconChainHarness, generate_data_column_sidecars_from_block};
 use eth2::types::{EventKind, SseBlobSidecar, SseDataColumnSidecar};
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::SeedableRng;
 use std::sync::Arc;
+use tokio::sync::broadcast::error::TryRecvError;
 use types::blob_sidecar::FixedBlobSidecarList;
 use types::test_utils::TestRandom;
-use types::{BlobSidecar, DataColumnSidecar, EthSpec, ForkName, MinimalEthSpec, Slot};
+use types::{BlobSidecar, BlockImportSource, DataColumnSidecar, EthSpec, ForkName, MinimalEthSpec, Slot};
 
 type E = MinimalEthSpec;
 
@@ -182,4 +186,88 @@ async fn data_column_sidecar_event_on_process_rpc_columns() {
         sidecar_event,
         EventKind::DataColumnSidecar(expected_sse_data_column)
     );
+}
+
+/// Verifies that data column events are emitted when columns are reconstructed.
+#[tokio::test]
+async fn data_column_sidecar_event_on_reconstruction() {
+    let spec = Arc::new(ForkName::Fulu.make_genesis_spec(E::default_spec()));
+    let harness = BeaconChainHarness::builder(E::default())
+        .spec(spec.clone())
+        .deterministic_keypairs(8)
+        .fresh_ephemeral_store()
+        .mock_execution_layer()
+        .node_custody_type(NodeCustodyType::Supernode)
+        .build();
+
+    let event_handler = harness.chain.event_handler.as_ref().unwrap();
+    let mut data_column_event_receiver = event_handler.subscribe_data_column_sidecar();
+
+    // Build a block with blobs and generate data columns
+    harness.execution_block_generator().set_min_blob_count(1);
+    let head_state = harness.get_current_state();
+    let slot = head_state.slot() + 1;
+    let ((signed_block, _), _) = harness.make_block(head_state, slot).await;
+    let all_data_columns = generate_data_column_sidecars_from_block(&signed_block, &spec);
+    let block_root = signed_block.canonical_root();
+
+    // Add block to DA checker (required for reconstruction)
+    harness
+        .chain
+        .data_availability_checker
+        .put_pre_execution_block(block_root, signed_block, BlockImportSource::Gossip)
+        .unwrap();
+
+    // Add 50% of columns (indices 0-63) to trigger reconstruction threshold
+    let columns_to_add: Vec<_> = all_data_columns
+        .iter()
+        .take(E::number_of_columns() / 2)
+        .cloned()
+        .collect();
+    let added_indices: std::collections::HashSet<u64> =
+        columns_to_add.iter().map(|c| c.index).collect();
+
+    let kzg = harness.chain.kzg.as_ref();
+    let verified_columns: Vec<_> = columns_to_add
+        .into_iter()
+        .map(|sidecar| {
+            KzgVerifiedCustodyDataColumn::new(CustodyDataColumn::from_asserted_custody(sidecar), kzg)
+                .unwrap()
+        })
+        .collect();
+
+    harness
+        .chain
+        .data_availability_checker
+        .put_kzg_verified_custody_data_columns(block_root, verified_columns)
+        .unwrap();
+
+    // Clear any prior events
+    while data_column_event_receiver.try_recv().is_ok() {}
+
+    // Trigger reconstruction
+    let (_, reconstructed) = harness
+        .chain
+        .reconstruct_data_columns(block_root)
+        .await
+        .unwrap()
+        .expect("reconstruction should succeed");
+    assert!(!reconstructed.is_empty());
+
+    // Collect SSE events (channel may overflow, so just verify we get some)
+    let mut received_indices = vec![];
+    loop {
+        match data_column_event_receiver.try_recv() {
+            Ok(EventKind::DataColumnSidecar(sse)) => received_indices.push(sse.index),
+            Ok(_) => panic!("unexpected event type"),
+            Err(TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    // Verify events are for reconstructed columns, not the originally-added ones
+    assert!(!received_indices.is_empty(), "should receive SSE events");
+    for idx in &received_indices {
+        assert!(!added_indices.contains(idx), "event for original column {idx}");
+    }
 }

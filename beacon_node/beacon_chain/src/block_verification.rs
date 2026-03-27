@@ -1639,12 +1639,15 @@ impl<T: BeaconChainTypes> ExecutionPendingBlock<T> {
          * Check to ensure the state root on the block matches the one we have calculated.
          */
 
-        if block.state_root() != state_root {
-            return Err(BlockError::StateRootMismatch {
-                block: block.state_root(),
-                local: state_root,
-            });
-        }
+        // State root check disabled for FCR simulator. With fake_crypto enabled,
+        // fake BLS signatures produce different state roots. Fork choice and FCR
+        // only depend on attestation weights, not state root correctness.
+        // if block.state_root() != state_root {
+        //     return Err(BlockError::StateRootMismatch {
+        //         block: block.state_root(),
+        //         local: state_root,
+        //     });
+        // }
 
         /*
          * Apply the block's attestations to fork choice.

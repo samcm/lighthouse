@@ -1,0 +1,49 @@
+[package]
+name = "fcr-simulator"
+version = "0.1.0"
+edition = { workspace = true }
+
+[features]
+default = []
+fake_crypto = [
+    "bls/fake_crypto",
+    "kzg/fake_crypto",
+    "state_processing/fake_crypto",
+]
+
+[dependencies]
+# Lighthouse crates
+beacon_chain = { workspace = true }
+bls = { workspace = true }
+execution_layer = { workspace = true }
+fork_choice = { workspace = true }
+kzg = { workspace = true }
+proto_array = { workspace = true }
+slot_clock = { workspace = true }
+state_processing = { workspace = true }
+store = { workspace = true }
+task_executor = { workspace = true }
+types = { workspace = true }
+logging = { workspace = true }
+ethereum_ssz = { workspace = true }
+sensitive_url = { workspace = true }
+tree_hash = { workspace = true }
+environment = { workspace = true }
+eth2_network_config = { workspace = true }
+
+# External crates
+anyhow = { workspace = true }
+clap = { workspace = true }
+csv = "1"
+futures = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snap = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

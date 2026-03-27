@@ -1696,7 +1696,24 @@ impl FastConfirmationRule {
             (maximum_support as u128 + proposer_score as u128 - support_discount as u128) / 2
                 + adversarial_weight as u128;
 
-        Ok(support as u128 > safety_threshold)
+        let confirmed = support as u128 > safety_threshold;
+        if !confirmed {
+            tracing::debug!(
+                block = ?block_root,
+                block_slot = %block_slot,
+                parent_slot = %parent_slot,
+                current_slot = %current_slot,
+                support,
+                maximum_support,
+                proposer_score,
+                support_discount,
+                adversarial_weight,
+                safety_threshold,
+                "is_one_confirmed FAILED"
+            );
+        }
+
+        Ok(confirmed)
     }
 }
 

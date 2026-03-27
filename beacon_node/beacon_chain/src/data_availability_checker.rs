@@ -809,6 +809,22 @@ impl<E: EthSpec> AvailableBlock<E> {
         })
     }
 
+    /// Create an AvailableBlock without DA validation checks.
+    /// Used by the FCR simulator where we replay historical blocks without blob data.
+    pub fn new_without_da_check(
+        block: Arc<SignedBeaconBlock<E>>,
+        spec: Arc<ChainSpec>,
+    ) -> Self {
+        let block_root = block.canonical_root();
+        Self {
+            block_root,
+            block,
+            blob_data: AvailableBlockData::NoData,
+            blobs_available_timestamp: None,
+            spec,
+        }
+    }
+
     pub fn block(&self) -> &SignedBeaconBlock<E> {
         &self.block
     }

@@ -86,6 +86,7 @@ members = [
     "validator_client/validator_metrics",
     "validator_client/validator_services",
     "validator_manager",
+    "fcr-simulator",
 ]
 resolver = "2"
 

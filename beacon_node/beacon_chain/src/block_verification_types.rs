@@ -58,6 +58,12 @@ impl<E: EthSpec> Debug for RangeSyncBlock<E> {
 }
 
 impl<E: EthSpec> RangeSyncBlock<E> {
+    /// Create a RangeSyncBlock from an already-available block (bypasses DA checks).
+    /// Used by the FCR simulator for replaying historical blocks without blob data.
+    pub fn from_available_block(block: AvailableBlock<E>) -> Self {
+        Self { block }
+    }
+
     pub fn block_root(&self) -> Hash256 {
         self.block.block_root()
     }

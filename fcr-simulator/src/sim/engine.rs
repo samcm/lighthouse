@@ -170,9 +170,16 @@ impl Engine {
 
             // Process block if it exists
             if let Some(ref block) = block_at_slot {
-                self.process_block(block)
-                    .await
-                    .with_context(|| format!("failed to process block at slot {}", slot))?;
+                if let Err(e) = self.process_block(block).await {
+                    // Log full error but don't crash - skip this block and continue.
+                    // Known issue: blocks at ERA boundaries can fail due to state
+                    // transition edge cases. The data is still valid for surrounding slots.
+                    tracing::error!(
+                        slot = %slot,
+                        error = %e,
+                        "Failed to process block, skipping"
+                    );
+                }
             }
 
             // Recompute head after block processing

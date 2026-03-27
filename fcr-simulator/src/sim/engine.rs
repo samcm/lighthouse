@@ -177,8 +177,8 @@ impl Engine {
             // Recompute head after block processing
             self.chain.recompute_head_at_current_slot().await;
 
-            // Peek ahead: find the next block and inject attestations for this slot
-            let num_injected = self.inject_peek_ahead_attestations(slot)?;
+            // Inject attestations from the next block (simulates them arriving during this slot)
+            let num_injected = self.inject_next_block_attestations(slot)?;
 
             // Advance clock and recompute head to trigger FCR with injected attestations
             if num_injected > 0 {
@@ -278,49 +278,42 @@ impl Engine {
         Ok(())
     }
 
-    /// Inject attestations for `current_slot` by scanning forward to find the next block.
+    /// Inject attestations from the next block into fork choice.
     ///
-    /// Attestations for slot N get included in the next available block (N+1, N+2, etc.).
-    /// If slot N+1 is missed, the attestations still exist - they just land in a later block.
-    /// We scan forward (up to 32 slots = 1 epoch, the inclusion deadline) to find them.
-    fn inject_peek_ahead_attestations(&mut self, current_slot: Slot) -> Result<u64> {
-        // Scan forward up to 32 slots to find the next block containing attestations for current_slot
-        let max_lookahead = 32u64;
-        let mut found_block = None;
+    /// This simulates what a real node would see: the next block's attestations
+    /// arriving during the current slot. If the next slot is missed, we skip
+    /// ahead to find the next actual block (handling consecutive missed slots).
+    fn inject_next_block_attestations(&mut self, current_slot: Slot) -> Result<u64> {
+        // Find the next block. Usually N+1, but skip missed slots.
+        let max_missed = 4u64; // handle up to 4 consecutive missed slots
+        let mut next_block = None;
 
-        for offset in 1..=max_lookahead {
+        for offset in 1..=max_missed {
             let peek_slot = current_slot + offset;
-            match self.era_blocks.peek_next_block(peek_slot)? {
-                Some(block) => {
-                    found_block = Some((peek_slot, block.clone()));
-                    break;
-                }
-                None => continue,
+            if let Some(block) = self.era_blocks.peek_next_block(peek_slot)? {
+                next_block = Some((peek_slot, block.clone()));
+                break;
             }
         }
 
-        let (block_slot, next_block) = match found_block {
+        let (block_slot, block) = match next_block {
             Some(b) => b,
             None => return Ok(0),
         };
 
-        let attestation_count = next_block.message().body().attestations_len();
+        let attestation_count = block.message().body().attestations_len();
         if attestation_count == 0 {
             return Ok(0);
         }
 
         let head_snapshot = self.chain.head_snapshot();
         let head_state = &head_snapshot.beacon_state;
-
         let mut ctxt = ConsensusContext::new(block_slot);
 
-        // Collect indexed attestations, filtering to only those for current_slot
-        let mut indexed_attestations = Vec::new();
-        for attestation in next_block.message().body().attestations() {
-            // Only inject attestations that are for the current slot
-            if attestation.data().slot != current_slot {
-                continue;
-            }
+        // Inject ALL attestations from the next block - this is what a real node
+        // would see arriving during the current slot. No slot filtering.
+        let mut indexed_attestations = Vec::with_capacity(attestation_count);
+        for attestation in block.message().body().attestations() {
             match ctxt.get_indexed_attestation(head_state, attestation) {
                 Ok(indexed_ref) => {
                     indexed_attestations.push(indexed_ref.clone_as_indexed_attestation());
@@ -336,7 +329,6 @@ impl Engine {
             return Ok(0);
         }
 
-        // Inject into fork choice
         let inject_slot = current_slot + 1;
         let mut fc = self.chain.canonical_head.fork_choice_write_lock();
         let mut injected = 0u64;

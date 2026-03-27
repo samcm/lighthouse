@@ -120,8 +120,9 @@ impl Engine {
 
         // Build headless BeaconChain
         info!("Building headless BeaconChain");
+        let worker_id = progress.as_ref().map(|p| p.worker_id.load(Ordering::Relaxed)).unwrap_or(0);
         let (chain, runtime, db_dir) =
-            build_chain(checkpoint_state, checkpoint_block, genesis_state, &spec, config)
+            build_chain(checkpoint_state, checkpoint_block, genesis_state, &spec, config, &cache_dir, worker_id)
                 .context("failed to build BeaconChain")?;
 
         // Set up ERA block iterator
@@ -410,6 +411,8 @@ fn build_chain(
     genesis_state: types::BeaconState<MainnetEthSpec>,
     spec: &Arc<ChainSpec>,
     config: &Config,
+    cache_dir: &std::path::Path,
+    worker_id: u64,
 ) -> Result<(Arc<BeaconChain<T>>, TestRuntime, tempfile::TempDir)> {
     let runtime = TestRuntime::default();
 
@@ -417,7 +420,11 @@ fn build_chain(
     spec_mut.confirmation_byzantine_threshold = config.byzantine_threshold;
     let spec_arc = Arc::new(spec_mut);
 
-    let db_dir = tempfile::tempdir().context("failed to create temp DB directory")?;
+    // Use cache dir for DB storage, not system temp (macOS cleans /tmp aggressively)
+    let db_base = cache_dir.join("db");
+    std::fs::create_dir_all(&db_base)?;
+    let db_dir = tempfile::tempdir_in(&db_base)
+        .context("failed to create DB directory")?;
     let hot_path = db_dir.path().join("hot");
     let cold_path = db_dir.path().join("cold");
     let blobs_path = db_dir.path().join("blobs");

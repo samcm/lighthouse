@@ -188,9 +188,11 @@ impl Engine {
             // Inject attestations from the next block (simulates them arriving during this slot)
             let num_injected = self.inject_next_block_attestations(slot)?;
 
-            // Advance clock and recompute head to trigger FCR with injected attestations
+            // Recompute head to trigger FCR with the injected attestations.
+            // Important: do NOT advance the slot clock here. Advancing to slot N+1
+            // would trigger FCR's epoch boundary rotation prematurely (before block
+            // N+1 is processed), causing stale observed justified checkpoints.
             if num_injected > 0 {
-                self.chain.slot_clock.set_slot(slot.as_u64() + 1);
                 self.chain.recompute_head_at_current_slot().await;
             }
 

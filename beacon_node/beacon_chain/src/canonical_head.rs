@@ -983,7 +983,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         );
 
         if is_epoch_transition || reorg_distance.is_some() {
-            self.persist_fork_choice()?;
+            if !self.store.get_config().skip_disk_writes {
+                self.persist_fork_choice()?;
+            }
             self.op_pool.prune_attestations(self.epoch()?);
         }
 

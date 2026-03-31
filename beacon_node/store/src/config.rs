@@ -64,6 +64,10 @@ pub struct StoreConfig {
     /// The margin for blob pruning in epochs. The oldest blobs are pruned up until
     /// data_availability_boundary - blob_prune_margin_epochs. Default: 0.
     pub blob_prune_margin_epochs: u64,
+    /// Skip all disk writes. The in-memory state cache is still populated so that
+    /// parent state lookups work. Intended for the FCR simulator.
+    #[serde(default)]
+    pub skip_disk_writes: bool,
 }
 
 /// Variant of `StoreConfig` that gets written to disk. Contains immutable configuration params.
@@ -120,6 +124,7 @@ impl Default for StoreConfig {
             prune_blobs: true,
             epochs_per_blob_prune: DEFAULT_EPOCHS_PER_BLOB_PRUNE,
             blob_prune_margin_epochs: DEFAULT_BLOB_PUNE_MARGIN_EPOCHS,
+            skip_disk_writes: false,
         }
     }
 }

@@ -1691,6 +1691,10 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> HotColdDB<E, Hot, Cold> 
             PutStateOutcome::Finalized | PutStateOutcome::PreFinalizedHDiffBuffer => {}
         }
 
+        if self.config.skip_disk_writes {
+            return Ok(());
+        }
+
         // Computing diffs is expensive so we avoid it if we already have this state stored on
         // disk.
         if self.load_hot_state_summary(state_root)?.is_some() {

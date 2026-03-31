@@ -171,9 +171,6 @@ impl Engine {
             // Process block if it exists
             if let Some(ref block) = block_at_slot {
                 if let Err(e) = self.process_block(block).await {
-                    // Log full error but don't crash - skip this block and continue.
-                    // Known issue: blocks at ERA boundaries can fail due to state
-                    // transition edge cases. The data is still valid for surrounding slots.
                     tracing::error!(
                         slot = %slot,
                         error = %e,
@@ -182,19 +179,16 @@ impl Engine {
                 }
             }
 
-            // Recompute head after block processing
-            self.chain.recompute_head_at_current_slot().await;
-
             // Inject attestations from the next block (simulates them arriving during this slot)
             let num_injected = self.inject_next_block_attestations(slot)?;
 
-            // Recompute head to trigger FCR with the injected attestations.
-            // Important: do NOT advance the slot clock here. Advancing to slot N+1
-            // would trigger FCR's epoch boundary rotation prematurely (before block
-            // N+1 is processed), causing stale observed justified checkpoints.
-            if num_injected > 0 {
-                self.chain.recompute_head_at_current_slot().await;
-            }
+            // Single recompute_head after both block processing and attestation injection.
+            // This is valid because:
+            // - fork choice already knows about the block (on_block runs inside process_block)
+            // - attestation injection writes directly to fork choice via on_attestation
+            // - committee caches in the head state are epoch-stable, so the stale head
+            //   from the previous slot works for get_indexed_attestation
+            self.chain.recompute_head_at_current_slot().await;
 
             if is_recording {
                 let result = self.build_slot_result(slot, has_block, num_injected);
@@ -443,7 +437,10 @@ fn build_chain(
         &cold_path,
         &blobs_path,
         |_, _, _| Ok(()),
-        StoreConfig::default(),
+        StoreConfig {
+            skip_disk_writes: true,
+            ..StoreConfig::default()
+        },
         spec_arc.clone(),
     )
     .map_err(|e| anyhow::anyhow!("failed to create disk store: {:?}", e))?;

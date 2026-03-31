@@ -1527,17 +1527,16 @@ impl<T: BeaconChainTypes> ExecutionPendingBlock<T> {
 
                 // Store the state immediately. States are ONLY deleted on finalization pruning, so
                 // we won't have race conditions where we should have written a state and didn't.
-                let state_already_exists =
-                    chain.store.load_hot_state_summary(&state_root)?.is_some();
+                if !chain.store.get_config().skip_disk_writes {
+                    let state_already_exists =
+                        chain.store.load_hot_state_summary(&state_root)?.is_some();
 
-                if state_already_exists {
-                    // If the state exists, we do not need to re-write it.
-                } else {
-                    // Recycle store codepath to create a state summary and store the state / diff
-                    let mut ops = vec![];
-                    chain.store.store_hot_state(&state_root, &state, &mut ops)?;
-                    chain.store.hot_db.do_atomically(ops)?;
-                };
+                    if !state_already_exists {
+                        let mut ops = vec![];
+                        chain.store.store_hot_state(&state_root, &state, &mut ops)?;
+                        chain.store.hot_db.do_atomically(ops)?;
+                    }
+                }
 
                 state_root
             };
@@ -1629,7 +1628,15 @@ impl<T: BeaconChainTypes> ExecutionPendingBlock<T> {
 
         let state_root_timer = metrics::start_timer(&metrics::BLOCK_PROCESSING_STATE_ROOT);
 
-        let state_root = state.update_tree_hash_cache()?;
+        let _state_root = if chain.store.get_config().skip_disk_writes {
+            // Skip the expensive tree hash — the result is unused because the state
+            // root check is disabled. We still need to apply pending mutations so the
+            // state can be accepted by the state cache.
+            state.apply_pending_mutations()?;
+            Hash256::ZERO
+        } else {
+            state.update_tree_hash_cache()?
+        };
 
         metrics::stop_timer(state_root_timer);
 

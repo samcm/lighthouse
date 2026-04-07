@@ -182,13 +182,17 @@ impl Engine {
             // Inject attestations from the next block (simulates them arriving during this slot)
             let num_injected = self.inject_next_block_attestations(slot)?;
 
-            // Single recompute_head after both block processing and attestation injection.
-            // This is valid because:
-            // - fork choice already knows about the block (on_block runs inside process_block)
-            // - attestation injection writes directly to fork choice via on_attestation
-            // - committee caches in the head state are epoch-stable, so the stale head
-            //   from the previous slot works for get_indexed_attestation
-            self.chain.recompute_head_at_current_slot().await;
+            // The spec's on_tick_per_slot_after_attestations_applied evaluates FCR
+            // at slot N+1 with attestations from slot N applied. This matters because
+            // is_one_confirmed computes:
+            //   maximum_support = estimate_committee_weight(parent_slot+1, current_slot-1)
+            // If current_slot == block_slot, that range is empty, maximum_support = 0,
+            // and everything trivially confirms. Evaluating at slot+1 gives the correct
+            // non-zero denominator.
+            //
+            // Note: inject_next_block_attestations already advances fork choice time to
+            // slot+1 via on_attestation, so epoch boundary snapshots are handled correctly.
+            self.chain.recompute_head_at_slot(slot + 1).await;
 
             if is_recording {
                 let result = self.build_slot_result(slot, has_block, num_injected);
@@ -379,12 +383,8 @@ impl Engine {
                 (Hash256::ZERO, 0)
             };
 
-        // "confirmed" = the head (or within 1 slot of it) has been confirmed by FCR.
-        // confirmation_delay_slots == 0 means the head itself is confirmed.
-        // confirmation_delay_slots == 1 is normal (FCR confirms the previous slot's block
-        // once attestations arrive in the current slot).
         let delay = slot.as_u64().saturating_sub(confirmed_slot);
-        let confirmed = confirmed_root != Hash256::ZERO && delay <= 1;
+        let confirmed = confirmed_root == head_root;
 
         let epoch = slot.as_u64() / 32;
 

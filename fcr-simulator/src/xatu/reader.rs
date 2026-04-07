@@ -158,9 +158,14 @@ fn parse_parquet_file(path: &Path) -> Result<HashMap<u64, SlotAttestationData>> 
                 .with_context(|| format!("failed to parse slot_offsets for slot {}", slot))?;
 
             // Parse vote_ids: list[u8]
+            // v1 parquets have an off-by-one: dense_rank included NULL rows,
+            // so non-255 vote_ids are shifted up by 1. Fix on load.
             let vote_ids_arr = vote_ids_col.value(row);
-            let vote_ids = extract_u8_list(&vote_ids_arr)
-                .with_context(|| format!("failed to parse vote_ids for slot {}", slot))?;
+            let vote_ids: Vec<u8> = extract_u8_list(&vote_ids_arr)
+                .with_context(|| format!("failed to parse vote_ids for slot {}", slot))?
+                .into_iter()
+                .map(|id| if id == 255 { 255 } else { id.saturating_sub(1) })
+                .collect();
 
             // Parse votes: list[struct{head_root, source_epoch, source_root, target_epoch, target_root}]
             let votes_arr = votes_col.value(row);

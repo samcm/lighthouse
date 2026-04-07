@@ -455,10 +455,18 @@ impl Engine {
             }
         };
 
-        // Build flat validator list in committee position order (matching xatu data layout)
+        // Build flat validator list matching the xatu parquet committee ordering.
+        // v1 parquets sorted committee_index lexicographically ("0","1","10",...,"2","20",...),
+        // so we must iterate committees in the same order.
+        let mut indexed_committees: Vec<(usize, &[usize])> = committees
+            .iter()
+            .map(|c| (c.index as usize, c.committee))
+            .collect();
+        indexed_committees.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+
         let mut validators_in_order: Vec<usize> = Vec::new();
-        for committee in &committees {
-            validators_in_order.extend_from_slice(committee.committee);
+        for (_, committee) in &indexed_committees {
+            validators_in_order.extend_from_slice(committee);
         }
         drop(head_snapshot);
 

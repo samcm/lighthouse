@@ -477,22 +477,16 @@ impl Engine {
         let mut immediate = Vec::new();
         for (pos, &validator_index) in validators_in_order.iter().enumerate() {
             let offset = match slot_data.slot_offsets.get(pos) {
-                Some(&255) | None => continue, // not seen by xatu
+                Some(&255) | None => continue,
                 Some(&o) => o,
             };
 
             let vote_id = match slot_data.vote_ids.get(pos) {
-                Some(&255) | None => continue, // no vote data
+                Some(&255) | None => continue,
                 Some(&id) => id as usize,
             };
 
             let Some(vote) = slot_data.votes.get(vote_id) else {
-                debug!(
-                    slot = %current_slot,
-                    position = pos,
-                    vote_id,
-                    "vote_id out of range, skipping"
-                );
                 continue;
             };
 

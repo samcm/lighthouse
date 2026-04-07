@@ -6966,6 +6966,7 @@ dependencies = [
  "seq-macro",
  "thrift",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]

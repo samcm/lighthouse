@@ -40,7 +40,7 @@ csv = "1"
 futures = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
-parquet = { version = "55", default-features = false, features = ["arrow"] }
+parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
 rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

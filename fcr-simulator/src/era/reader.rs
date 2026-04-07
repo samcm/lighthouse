@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use snap::read::FrameDecoder;
 use types::{ChainSpec, MainnetEthSpec, SignedBeaconBlock, Slot};
 

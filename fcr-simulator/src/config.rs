@@ -48,27 +48,35 @@ pub struct Config {
     /// Each worker uses ~2GB RAM for the BeaconState.
     #[arg(long, default_value = "1")]
     pub parallel: u64,
+
+    /// Use real attestation timing data from xatu instead of next-block attestations.
+    /// Downloads daily parquet files from R2 with per-validator timing information.
+    #[arg(long)]
+    pub use_xatu_attestations: bool,
 }
 
 impl Config {
     pub fn resolved_cache_dir(&self) -> PathBuf {
         let path = self.cache_dir.to_string_lossy();
-        if path.starts_with("~/") {
-            if let Some(home) = dirs_fallback() {
-                return home.join(&path[2..]);
-            }
+        if path.starts_with("~/")
+            && let Some(home) = dirs_fallback()
+        {
+            return home.join(&path[2..]);
         }
         self.cache_dir.clone()
     }
 
+    #[allow(dead_code)]
     pub fn start_slot(&self) -> u64 {
         self.start_epoch * 32
     }
 
+    #[allow(dead_code)]
     pub fn end_slot(&self) -> u64 {
         self.end_epoch * 32
     }
 
+    #[allow(dead_code)]
     pub fn warmup_start_slot(&self) -> u64 {
         self.start_epoch.saturating_sub(self.warmup_epochs) * 32
     }

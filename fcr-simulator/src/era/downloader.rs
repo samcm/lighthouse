@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 
 use super::reader;
@@ -19,7 +19,10 @@ impl EraDownloader {
     pub fn new(base_url: &str, cache_dir: &Path) -> Result<Self> {
         let era_dir = cache_dir.join("era");
         fs::create_dir_all(&era_dir).with_context(|| {
-            format!("failed to create ERA cache directory: {}", era_dir.display())
+            format!(
+                "failed to create ERA cache directory: {}",
+                era_dir.display()
+            )
         })?;
 
         Ok(Self {
@@ -87,17 +90,16 @@ impl EraDownloader {
 
         let mut filenames = Vec::new();
         for line in body.lines() {
-            if let Some(start) = line.find("mainnet-") {
-                if let Some(end) = line[start..].find(".era") {
-                    let filename = &line[start..start + end + 4];
-                    if let Some(num_str) = filename
-                        .strip_prefix("mainnet-")
-                        .and_then(|s| s.split('-').next())
-                    {
-                        if let Ok(era_num) = num_str.parse::<u64>() {
-                            filenames.push((era_num, filename.to_string()));
-                        }
-                    }
+            if let Some(start) = line.find("mainnet-")
+                && let Some(end) = line[start..].find(".era")
+            {
+                let filename = &line[start..start + end + 4];
+                if let Some(num_str) = filename
+                    .strip_prefix("mainnet-")
+                    .and_then(|s| s.split('-').next())
+                    && let Ok(era_num) = num_str.parse::<u64>()
+                {
+                    filenames.push((era_num, filename.to_string()));
                 }
             }
         }
@@ -133,7 +135,10 @@ impl EraDownloader {
         }
 
         // Fallback: download with retries (shouldn't happen if pre_download was called)
-        warn!(era = era_number, "ERA file not in cache, downloading on-the-fly");
+        warn!(
+            era = era_number,
+            "ERA file not in cache, downloading on-the-fly"
+        );
         self.download_era_with_retries(era_number, 3)?;
 
         let cached = self
@@ -201,9 +206,8 @@ impl EraDownloader {
             .to_vec();
 
         let cache_path = self.cache_dir.join(filename);
-        let mut file = fs::File::create(&cache_path).with_context(|| {
-            format!("failed to create cache file: {}", cache_path.display())
-        })?;
+        let mut file = fs::File::create(&cache_path)
+            .with_context(|| format!("failed to create cache file: {}", cache_path.display()))?;
         file.write_all(&data)?;
         info!(
             path = %cache_path.display(),
@@ -215,9 +219,8 @@ impl EraDownloader {
     }
 
     fn find_cached_file(&self, pattern: &str) -> Result<Option<PathBuf>> {
-        let entries = match fs::read_dir(&self.cache_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(None),
+        let Ok(entries) = fs::read_dir(&self.cache_dir) else {
+            return Ok(None);
         };
 
         for entry in entries {

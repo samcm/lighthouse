@@ -25,4 +25,5 @@ pub struct SlotResult {
     pub is_epoch_boundary: bool,
     pub is_missed_slot: bool,
     pub fcr_eval_duration_us: u64,
+    pub attestation_source: String,
 }

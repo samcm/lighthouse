@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::info;
 use types::{BeaconState, ChainSpec, MainnetEthSpec, SignedBeaconBlock, Slot};
 
@@ -30,8 +30,7 @@ fn fetch_ssz(url: &str) -> Result<Vec<u8>> {
 fn cached_or_fetch(cache_path: &Path, url: &str, label: &str) -> Result<Vec<u8>> {
     if cache_path.exists() {
         info!(path = %cache_path.display(), "Loading cached {}", label);
-        return fs::read(cache_path)
-            .with_context(|| format!("failed to read cached {}", label));
+        return fs::read(cache_path).with_context(|| format!("failed to read cached {}", label));
     }
 
     info!(url = %url, "Fetching {} (this may take a while)", label);

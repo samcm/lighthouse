@@ -66,7 +66,7 @@ impl OutputWriter {
 
     /// Flush to disk periodically so we don't lose progress on crash.
     pub fn flush_if_needed(&mut self, records_written: u64) -> Result<()> {
-        if records_written % 100 == 0 {
+        if records_written.is_multiple_of(100) {
             self.flush_inner()?;
         }
         Ok(())
@@ -74,12 +74,9 @@ impl OutputWriter {
 
     /// Final flush.
     pub fn flush(&mut self) -> Result<()> {
-        match self.format {
-            OutputFormat::Json => {
-                let writer = self.json_file.as_mut().expect("json writer should exist");
-                writer.write_all(b"\n]\n")?;
-            }
-            _ => {}
+        if let OutputFormat::Json = self.format {
+            let writer = self.json_file.as_mut().expect("json writer should exist");
+            writer.write_all(b"\n]\n")?;
         }
         self.flush_inner()
     }

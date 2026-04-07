@@ -3,11 +3,12 @@ mod config;
 mod era;
 mod output;
 mod sim;
+mod xatu;
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -47,9 +48,8 @@ async fn main() -> Result<()> {
     let latest_slot = ranges.last().map(|(_, e)| e * 32).unwrap_or(0);
 
     info!(earliest_slot, latest_slot, "Pre-downloading ERA files");
-    let mut downloader =
-        era::EraDownloader::new(&config.era_url, &config.resolved_cache_dir())
-            .context("failed to create ERA downloader")?;
+    let mut downloader = era::EraDownloader::new(&config.era_url, &config.resolved_cache_dir())
+        .context("failed to create ERA downloader")?;
     downloader
         .pre_download(earliest_slot, latest_slot)
         .context("failed to pre-download ERA files")?;

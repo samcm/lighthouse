@@ -4049,12 +4049,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         // See https://github.com/sigp/lighthouse/issues/2028
         let (_, signed_block, block_data) = signed_block.deconstruct();
 
-        if !self.store.get_config().skip_disk_writes {
-            if let Some(blobs_or_columns_store_op) =
+        if !self.store.get_config().skip_disk_writes
+            && let Some(blobs_or_columns_store_op) =
                 self.get_blobs_or_columns_store_op(block_root, signed_block.slot(), block_data)
-            {
-                ops.push(blobs_or_columns_store_op);
-            }
+        {
+            ops.push(blobs_or_columns_store_op);
         }
 
         let block = signed_block.message();

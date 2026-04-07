@@ -30,7 +30,6 @@ type T = DiskHarnessType<MainnetEthSpec>;
 
 pub struct WorkerResult {
     pub total_slots: u64,
-    pub confirmed: u64,
     pub duration_secs: f64,
 }
 
@@ -188,7 +187,6 @@ impl Engine {
 
         let mut slot = self.config.warmup_start_slot + 1;
         let mut processed = 0u64;
-        let mut confirmed_count = 0u64;
         let mut total_recorded = 0u64;
         let batch_start = Instant::now();
 
@@ -239,9 +237,6 @@ impl Engine {
                 };
                 let result =
                     self.build_slot_result(slot, has_block, num_injected, attestation_source);
-                if result.confirmed {
-                    confirmed_count += 1;
-                }
                 total_recorded += 1;
                 self.output.write(&result)?;
                 self.output.flush_if_needed(total_recorded)?;
@@ -251,7 +246,7 @@ impl Engine {
                     progress
                         .current_slot
                         .store(slot.as_u64(), Ordering::Relaxed);
-                    progress.confirmed.store(confirmed_count, Ordering::Relaxed);
+                    progress.confirmed.store(0, Ordering::Relaxed);
                     progress
                         .total_recorded
                         .store(total_recorded, Ordering::Relaxed);
@@ -271,7 +266,6 @@ impl Engine {
                     total = total_slots,
                     slots_per_sec = format!("{:.1}", slots_per_sec),
                     eta_mins = format!("{:.1}", eta_secs / 60.0),
-                    confirmed = confirmed_count,
                     total_recorded,
                     "Progress"
                 );
@@ -282,23 +276,14 @@ impl Engine {
 
         self.output.flush()?;
 
-        let confirm_rate = if total_recorded > 0 {
-            confirmed_count as f64 / total_recorded as f64 * 100.0
-        } else {
-            0.0
-        };
-
         info!(
             total_slots = total_recorded,
-            confirmed = confirmed_count,
-            confirmation_rate = format!("{:.2}%", confirm_rate),
             duration_secs = format!("{:.1}", batch_start.elapsed().as_secs_f64()),
             "Worker complete"
         );
 
         Ok(WorkerResult {
             total_slots: total_recorded,
-            confirmed: confirmed_count,
             duration_secs: batch_start.elapsed().as_secs_f64(),
         })
     }
@@ -568,8 +553,6 @@ impl Engine {
             };
 
         let delay = slot.as_u64().saturating_sub(confirmed_slot);
-        let confirmed = confirmed_root == head_root;
-
         let epoch = slot.as_u64() / 32;
 
         SlotResult {
@@ -577,7 +560,6 @@ impl Engine {
             epoch,
             has_block,
             block_root: format!("{:?}", head_root),
-            confirmed,
             confirmed_root: format!("{:?}", confirmed_root),
             confirmed_slot,
             confirmation_delay_slots: delay,

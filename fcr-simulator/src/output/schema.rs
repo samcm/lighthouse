@@ -8,7 +8,6 @@ pub struct SlotResult {
     pub block_root: String,
 
     // FCR
-    pub confirmed: bool,
     pub confirmed_root: String,
     pub confirmed_slot: u64,
     pub confirmation_delay_slots: u64,

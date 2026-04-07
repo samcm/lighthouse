@@ -170,7 +170,6 @@ async fn progress_reporter(workers: Vec<Arc<sim::WorkerProgress>>, start_time: I
 
         let elapsed = start_time.elapsed().as_secs_f64();
         let mut total_recorded = 0u64;
-        let mut total_confirmed = 0u64;
         let mut total_target = 0u64;
         let mut worker_summaries = Vec::new();
 
@@ -179,7 +178,6 @@ async fn progress_reporter(workers: Vec<Arc<sim::WorkerProgress>>, start_time: I
             let current = w.current_slot.load(Ordering::Relaxed);
             let start = w.start_slot.load(Ordering::Relaxed);
             let end = w.end_slot.load(Ordering::Relaxed);
-            let confirmed = w.confirmed.load(Ordering::Relaxed);
             let recorded = w.total_recorded.load(Ordering::Relaxed);
 
             let target = end.saturating_sub(start);
@@ -191,7 +189,6 @@ async fn progress_reporter(workers: Vec<Arc<sim::WorkerProgress>>, start_time: I
             };
 
             total_recorded += recorded;
-            total_confirmed += confirmed;
             total_target += target;
 
             worker_summaries.push(format!("W{}: {:.0}%", id, pct));
@@ -216,17 +213,10 @@ async fn progress_reporter(workers: Vec<Arc<sim::WorkerProgress>>, start_time: I
             0.0
         };
 
-        let confirm_rate = if total_recorded > 0 {
-            total_confirmed as f64 / total_recorded as f64 * 100.0
-        } else {
-            0.0
-        };
-
         info!(
             progress = format!("{}/{} ({:.1}%)", total_recorded, total_target, overall_pct),
             slots_per_sec = format!("{:.1}", slots_per_sec),
             eta = format!("{:.0}m", eta_mins),
-            confirmed = format!("{:.1}%", confirm_rate),
             workers = worker_summaries.join(", "),
             "Overall progress"
         );
@@ -267,22 +257,13 @@ fn merge_csv_outputs(worker_paths: &[PathBuf], output: &PathBuf) -> Result<()> {
 
 fn log_summary(results: &[sim::WorkerResult]) {
     let total_slots: u64 = results.iter().map(|r| r.total_slots).sum();
-    let confirmed: u64 = results.iter().map(|r| r.confirmed).sum();
     let max_duration = results
         .iter()
         .map(|r| r.duration_secs)
         .fold(0.0f64, f64::max);
 
-    let rate = if total_slots > 0 {
-        confirmed as f64 / total_slots as f64 * 100.0
-    } else {
-        0.0
-    };
-
     info!(
         total_slots,
-        confirmed,
-        confirmation_rate = format!("{:.2}%", rate),
         wall_time_secs = format!("{:.1}", max_duration),
         workers = results.len(),
         "Simulation complete"

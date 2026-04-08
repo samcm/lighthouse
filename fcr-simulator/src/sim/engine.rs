@@ -210,8 +210,10 @@ impl Engine {
                 );
             }
 
-            // Inject attestations based on the configured source
-            let num_injected = if self.config.use_xatu_attestations {
+            // Inject attestations based on the configured source.
+            // During warmup, always use ERA attestations to avoid injecting votes
+            // for non-canonical block roots that corrupt fork choice state.
+            let num_injected = if self.config.use_xatu_attestations && is_recording {
                 self.inject_xatu_attestations(slot)?
             } else {
                 self.inject_next_block_attestations(slot)?
@@ -376,7 +378,22 @@ impl Engine {
             if let Err(e) =
                 fc.on_attestation(inject_slot, indexed.to_ref(), AttestationFromBlock::True)
             {
-                debug!(error = ?e, "Failed to inject attestation");
+                let target_root = indexed.to_ref().data().target.root;
+                let target_in_fc = fc.proto_array().contains_block(&target_root);
+                let head_root = indexed.to_ref().data().beacon_block_root;
+                let head_in_fc = fc.proto_array().contains_block(&head_root);
+                let finalized = fc.finalized_checkpoint();
+                warn!(
+                    error = ?e,
+                    %current_slot,
+                    ?target_root,
+                    target_in_fc,
+                    ?head_root,
+                    head_in_fc,
+                    finalized_epoch = %finalized.epoch,
+                    finalized_root = ?finalized.root,
+                    "Failed to inject attestation"
+                );
             } else {
                 injected += 1;
             }

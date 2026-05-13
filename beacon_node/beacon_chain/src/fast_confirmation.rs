@@ -727,6 +727,9 @@ impl FastConfirmationRule {
         let observed_jcp = &self.current_epoch_observed_justified_checkpoint;
         if is_epoch_start
             && observed_jcp.epoch.saturating_add(1u64) == current_epoch
+            && self
+                .block_epoch::<E>(observed_jcp.root, proto_array)
+                .is_some_and(|e| e.saturating_add(1u64) == current_epoch)
             && *observed_jcp == self.unrealized_justification_of(head_root, proto_array)?
             && self.block_slot(confirmed_root, proto_array)?
                 < self.block_slot(observed_jcp.root, proto_array)?
@@ -1215,8 +1218,8 @@ impl FastConfirmationRule {
         )?;
         let total_active = self.head_balance_source.total_active_balance;
 
-        // 3 * honest_ffg >= 1 * total_active (i.e. honest > 1/3)
-        Ok(3u128 * honest_ffg as u128 >= total_active as u128)
+        // 3 * honest_ffg > 1 * total_active (i.e. honest strictly > 1/3)
+        Ok(3u128 * honest_ffg as u128 > total_active as u128)
     }
 
     /// Spec: `will_current_target_be_justified`.
@@ -1284,7 +1287,7 @@ impl FastConfirmationRule {
             //        get_latest_message_epoch(latest_messages[i]))
             // Use the VOTE's epoch, not the current epoch.
             let vote_root = vote.current_root();
-            let vote_epoch = vote.latest_message_epoch();
+            let vote_epoch = vote.latest_message_slot().epoch(E::slots_per_epoch());
             let vote_target =
                 if cached_valid && vote_root == cached_root && vote_epoch == cached_epoch {
                     Some(cached_target)
@@ -1364,7 +1367,7 @@ impl FastConfirmationRule {
             .indices
             .get(&root)
             .and_then(|&idx| proto_array.nodes.get(idx))
-            .map(|n| n.slot)
+            .map(|n| n.slot())
             .ok_or(Error::NodeNotFound(root))
     }
 
@@ -1377,7 +1380,7 @@ impl FastConfirmationRule {
             .indices
             .get(&root)
             .and_then(|&idx| proto_array.nodes.get(idx))
-            .map(|n| n.slot.epoch(E::slots_per_epoch()))
+            .map(|n| n.slot().epoch(E::slots_per_epoch()))
     }
 
     fn parent_root(&self, root: Hash256, proto_array: &ProtoArray) -> Option<Hash256> {
@@ -1385,9 +1388,9 @@ impl FastConfirmationRule {
             .indices
             .get(&root)
             .and_then(|&idx| proto_array.nodes.get(idx))
-            .and_then(|n| n.parent)
+            .and_then(|n| n.parent())
             .and_then(|parent_idx| proto_array.nodes.get(parent_idx))
-            .map(|n| n.root)
+            .map(|n| n.root())
     }
 
     fn is_ancestor(
@@ -1456,7 +1459,7 @@ impl FastConfirmationRule {
             .indices
             .get(&root)
             .and_then(|&idx| proto_array.nodes.get(idx))
-            .and_then(|n| n.unrealized_justified_checkpoint)
+            .and_then(|n| n.unrealized_justified_checkpoint())
             .ok_or(Error::UnrealizedJustificationNotFound(root))
     }
 
@@ -1469,7 +1472,7 @@ impl FastConfirmationRule {
             .indices
             .get(&root)
             .and_then(|&idx| proto_array.nodes.get(idx))
-            .and_then(|n| n.unrealized_justified_checkpoint)
+            .and_then(|n| n.unrealized_justified_checkpoint())
             .map(|cp| cp.epoch)
     }
 
@@ -1487,11 +1490,11 @@ impl FastConfirmationRule {
             .get(&root)
             .and_then(|&idx| proto_array.nodes.get(idx))?;
         let current_epoch = current_slot.epoch(E::slots_per_epoch());
-        let block_epoch = node.slot.epoch(E::slots_per_epoch());
+        let block_epoch = node.slot().epoch(E::slots_per_epoch());
         if current_epoch > block_epoch {
-            node.unrealized_justified_checkpoint.map(|cp| cp.epoch)
+            node.unrealized_justified_checkpoint().map(|cp| cp.epoch)
         } else {
-            Some(node.justified_checkpoint.epoch)
+            Some(node.justified_checkpoint().epoch)
         }
     }
 
@@ -1619,10 +1622,10 @@ impl FastConfirmationRule {
                 let Some(node) = proto_array.nodes.get(current_idx) else {
                     break;
                 };
-                if node.slot <= terminal_slot {
+                if node.slot() <= terminal_slot {
                     break;
                 }
-                match node.parent {
+                match node.parent() {
                     Some(parent_idx) => current_idx = parent_idx,
                     None => break,
                 }
@@ -1691,12 +1694,16 @@ impl FastConfirmationRule {
         )?;
 
         // Spec: compute_safety_threshold
-        // safety_threshold = (maximum_support + proposer_score - support_discount) / 2 + adversarial_weight
-        let safety_threshold =
-            (maximum_support as u128 + proposer_score as u128 - support_discount as u128) / 2
-                + adversarial_weight as u128;
+        // safety_threshold = (maximum_support + proposer_score + 2 * adversarial_weight - support_discount) / 2
+        // with an underflow guard
+        let numerator_without_discount = maximum_support + proposer_score + 2 * adversarial_weight;
+        let safety_threshold = if support_discount < numerator_without_discount {
+            (numerator_without_discount - support_discount) / 2
+        } else {
+            0
+        };
 
-        let confirmed = support as u128 > safety_threshold;
+        let confirmed = support > safety_threshold;
         if !confirmed {
             tracing::debug!(
                 block = ?block_root,
@@ -1735,9 +1742,13 @@ pub fn is_full_validator_set_covered<E: EthSpec>(start_slot: Slot, end_slot: Slo
 }
 
 /// Spec: `adjust_committee_weight_estimate_to_ensure_safety`.
+///
+/// Spec uses ceiling division: `(estimate + 999) // 1000`. The function exists to
+/// conservatively over-estimate committee weight; flooring would under-estimate and
+/// weaken the safety threshold.
 pub fn adjust_committee_weight_estimate_to_ensure_safety(estimate: u64) -> u64 {
-    (estimate / 1000)
-        .saturating_mul(1000u64.saturating_add(COMMITTEE_WEIGHT_ESTIMATION_ADJUSTMENT_FACTOR))
+    let ceil = estimate.saturating_add(999) / 1000;
+    ceil.saturating_mul(1000u64.saturating_add(COMMITTEE_WEIGHT_ESTIMATION_ADJUSTMENT_FACTOR))
 }
 
 /// Spec: `estimate_committee_weight_between_slots`.
@@ -1846,13 +1857,20 @@ mod tests {
 
     #[test]
     fn test_adjustment_factor() {
-        // 1000 -> 1000/1000 * 1005 = 1005
+        // Ceiling division: ceil(1000/1000) * 1005 = 1 * 1005 = 1005
         assert_eq!(
             adjust_committee_weight_estimate_to_ensure_safety(1000),
             1005
         );
-        // 999 -> 0 * 1005 = 0 (integer division)
-        assert_eq!(adjust_committee_weight_estimate_to_ensure_safety(999), 0);
+        // Ceiling division: ceil(999/1000) * 1005 = 1 * 1005 = 1005 (NOT 0)
+        assert_eq!(adjust_committee_weight_estimate_to_ensure_safety(999), 1005);
+        // Ceiling division: ceil(1500/1000) * 1005 = 2 * 1005 = 2010
+        assert_eq!(
+            adjust_committee_weight_estimate_to_ensure_safety(1500),
+            2010
+        );
+        // Edge case: 0 -> ceil(0/1000) = 0
+        assert_eq!(adjust_committee_weight_estimate_to_ensure_safety(0), 0);
     }
 
     mod slot_assignments {

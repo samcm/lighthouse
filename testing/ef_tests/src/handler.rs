@@ -340,6 +340,10 @@ impl<T, E> SszStaticHandler<T, E> {
     pub fn pre_electra() -> Self {
         Self::for_forks(ForkName::list_all()[0..5].to_vec())
     }
+
+    pub fn pre_capella() -> Self {
+        Self::for_forks(ForkName::list_all()[0..3].to_vec())
+    }
 }
 
 /// Handler for SSZ types that implement `CachedTreeHash`.
@@ -537,11 +541,6 @@ impl<E: EthSpec + TypeName> Handler for RandomHandler<E> {
     fn handler_name(&self) -> String {
         "random".into()
     }
-
-    fn disabled_forks(&self) -> Vec<ForkName> {
-        // TODO(gloas): remove once we have Gloas random tests
-        vec![ForkName::Gloas]
-    }
 }
 
 #[derive(Educe)]
@@ -709,15 +708,31 @@ impl<E: EthSpec + TypeName> Handler for ForkChoiceHandler<E> {
             return false;
         }
 
-        // No FCU override tests prior to bellatrix.
+        // No FCU override tests prior to bellatrix, and removed in Gloas.
         if self.handler_name == "should_override_forkchoice_update"
-            && !fork_name.bellatrix_enabled()
+            && (!fork_name.bellatrix_enabled() || fork_name.gloas_enabled())
         {
             return false;
         }
 
-        // Deposit tests exist only after Electra.
-        if self.handler_name == "deposit_with_reorg" && !fork_name.electra_enabled() {
+        // Deposit tests exist only for Electra and Fulu (not Gloas).
+        if self.handler_name == "deposit_with_reorg"
+            && (!fork_name.electra_enabled() || fork_name.gloas_enabled())
+        {
+            return false;
+        }
+
+        // Proposer head tests removed in Gloas.
+        if self.handler_name == "get_proposer_head" && fork_name.gloas_enabled() {
+            return false;
+        }
+
+        // on_execution_payload_envelope and get_parent_payload_status tests exist only for
+        // Gloas and later.
+        if (self.handler_name == "on_execution_payload_envelope"
+            || self.handler_name == "get_parent_payload_status")
+            && !fork_name.gloas_enabled()
+        {
             return false;
         }
 
@@ -727,8 +742,7 @@ impl<E: EthSpec + TypeName> Handler for ForkChoiceHandler<E> {
     }
 
     fn disabled_forks(&self) -> Vec<ForkName> {
-        // TODO(gloas): remove once we have Gloas fork choice tests
-        vec![ForkName::Gloas]
+        vec![]
     }
 }
 
@@ -772,59 +786,6 @@ impl<E: EthSpec + TypeName> Handler for FastConfirmationHandler<E> {
     fn disabled_forks(&self) -> Vec<ForkName> {
         // TODO(gloas): remove once we have Gloas fast confirmation tests
         vec![ForkName::Gloas]
-    }
-
-    // TODO(fast-confirmation): remove this override once consensus-spec-tests includes
-    // fast_confirmation test vectors. Until then, skip gracefully instead of panicking
-    // when the directory does not exist.
-    fn run_for_fork(&self, fork_name: ForkName) {
-        let fork_name_str = fork_name.to_string();
-
-        let handler_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("consensus-spec-tests")
-            .join("tests")
-            .join(Self::config_name())
-            .join(&fork_name_str)
-            .join(Self::runner_name())
-            .join(self.handler_name());
-
-        if !handler_path.is_dir() {
-            eprintln!(
-                "Skipping fast_confirmation tests for {}/{}: test vectors not found at {}",
-                fork_name_str,
-                self.handler_name(),
-                handler_path.display()
-            );
-            return;
-        }
-
-        let as_directory = |entry: Result<DirEntry, std::io::Error>| -> Option<DirEntry> {
-            entry
-                .ok()
-                .filter(|e| e.file_type().map(|ty| ty.is_dir()).unwrap())
-        };
-
-        let test_cases = fs::read_dir(&handler_path)
-            .unwrap_or_else(|e| panic!("handler dir {} exists: {:?}", handler_path.display(), e))
-            .filter_map(as_directory)
-            .flat_map(|suite| fs::read_dir(suite.path()).expect("suite dir exists"))
-            .filter_map(as_directory)
-            .map(|test_case_dir| {
-                let path = test_case_dir.path();
-                let case = Self::Case::load_from_dir(&path, fork_name).expect("test should load");
-                (path, case)
-            })
-            .collect();
-
-        let results = Cases { test_cases }.test_results(fork_name, Self::rayon_enabled());
-
-        let name = format!(
-            "{}/{}/{}",
-            fork_name_str,
-            Self::runner_name(),
-            self.handler_name()
-        );
-        crate::results::assert_tests_pass(&name, &handler_path, &results);
     }
 }
 

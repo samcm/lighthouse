@@ -24,11 +24,14 @@ use crate::beacon;
 use crate::config::Config;
 use crate::era::{EraBlockIterator, EraDownloader};
 use crate::output::{OutputWriter, SlotResult};
-use crate::xatu::XatuReader;
+use crate::xatu::{CommitteeOrder, XatuReader};
 
 type T = DiskHarnessType<MainnetEthSpec>;
 
 pub struct WorkerResult {
+    pub worker_id: u64,
+    pub start_slot: u64,
+    pub end_slot: u64,
     pub total_slots: u64,
     pub duration_secs: f64,
 }
@@ -79,6 +82,7 @@ pub struct Engine {
 }
 
 struct EngineConfig {
+    worker_id: u64,
     start_slot: Slot,
     end_slot: Slot,
     warmup_start_slot: Slot,
@@ -111,7 +115,7 @@ impl Engine {
         );
 
         // Fetch checkpoint state, block, and genesis state from beacon node
-        let checkpoint_state = beacon::fetch_beacon_state(
+        let mut checkpoint_state = beacon::fetch_beacon_state(
             &config.beacon_node_url,
             warmup_start_slot,
             &cache_dir,
@@ -119,9 +123,9 @@ impl Engine {
         )
         .context("failed to fetch checkpoint state")?;
 
-        let checkpoint_block = beacon::fetch_beacon_block(
+        let checkpoint_block = beacon::fetch_checkpoint_block(
             &config.beacon_node_url,
-            warmup_start_slot,
+            &mut checkpoint_state,
             &cache_dir,
             &spec,
         )
@@ -168,6 +172,7 @@ impl Engine {
             era_blocks,
             output,
             config: EngineConfig {
+                worker_id,
                 start_slot,
                 end_slot,
                 warmup_start_slot,
@@ -188,6 +193,8 @@ impl Engine {
         let mut slot = self.config.warmup_start_slot + 1;
         let mut processed = 0u64;
         let mut total_recorded = 0u64;
+        let mut first_recorded_slot = None;
+        let mut last_recorded_slot = None;
         let batch_start = Instant::now();
 
         while slot < self.config.end_slot {
@@ -197,17 +204,14 @@ impl Engine {
 
             // Get block for this slot from ERA files
             let block_at_slot = self.era_blocks.block_at_slot(slot)?.cloned();
+            let block_root = block_at_slot.as_ref().map(|block| block.canonical_root());
             let has_block = block_at_slot.is_some();
 
             // Process block if it exists
-            if let Some(ref block) = block_at_slot
-                && let Err(e) = self.process_block(block).await
-            {
-                tracing::error!(
-                    slot = %slot,
-                    error = %e,
-                    "Failed to process block, skipping"
-                );
+            if let Some(ref block) = block_at_slot {
+                self.process_block(block).await.with_context(|| {
+                    format!("failed to process canonical block at slot {}", slot)
+                })?;
             }
 
             // Inject attestations based on the configured source.
@@ -229,7 +233,8 @@ impl Engine {
             //
             // Note: inject_next_block_attestations already advances fork choice time to
             // slot+1 via on_attestation, so epoch boundary snapshots are handled correctly.
-            self.chain.recompute_head_at_slot(slot + 1).await;
+            let eval_slot = slot + 1;
+            self.chain.recompute_head_at_slot(eval_slot).await;
 
             if is_recording {
                 let attestation_source = if self.config.use_xatu_attestations {
@@ -237,9 +242,17 @@ impl Engine {
                 } else {
                     "era"
                 };
-                let result =
-                    self.build_slot_result(slot, has_block, num_injected, attestation_source);
+                let result = self.build_slot_result(
+                    slot,
+                    eval_slot,
+                    has_block,
+                    block_root,
+                    num_injected,
+                    attestation_source,
+                );
                 total_recorded += 1;
+                first_recorded_slot.get_or_insert(slot.as_u64());
+                last_recorded_slot = Some(slot.as_u64());
                 self.output.write(&result)?;
                 self.output.flush_if_needed(total_recorded)?;
 
@@ -285,6 +298,11 @@ impl Engine {
         );
 
         Ok(WorkerResult {
+            worker_id: self.config.worker_id,
+            start_slot: first_recorded_slot.unwrap_or(recording_start.as_u64()),
+            end_slot: last_recorded_slot
+                .map(|slot| slot.saturating_add(1))
+                .unwrap_or(recording_start.as_u64()),
             total_slots: total_recorded,
             duration_secs: batch_start.elapsed().as_secs_f64(),
         })
@@ -466,13 +484,16 @@ impl Engine {
         };
 
         // Build flat validator list matching the xatu parquet committee ordering.
-        // v1 parquets sorted committee_index lexicographically ("0","1","10",...,"2","20",...),
-        // so we must iterate committees in the same order.
         let mut indexed_committees: Vec<(usize, &[usize])> = committees
             .iter()
             .map(|c| (c.index as usize, c.committee))
             .collect();
-        indexed_committees.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+        match slot_data.committee_order {
+            CommitteeOrder::Numeric => indexed_committees.sort_by_key(|(index, _)| *index),
+            CommitteeOrder::Lexicographic => {
+                indexed_committees.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+            }
+        }
 
         let mut validators_in_order: Vec<usize> = Vec::new();
         for (_, committee) in &indexed_committees {
@@ -494,9 +515,10 @@ impl Engine {
         // Step 4: Process each committee position
         let mut immediate = Vec::new();
         for (pos, &validator_index) in validators_in_order.iter().enumerate() {
-            let offset = match slot_data.slot_offsets.get(pos) {
-                Some(&255) | None => continue,
-                Some(&o) => o,
+            let Some(arrival_slot) =
+                xatu_arrival_slot(current_slot, slot_data.slot_offsets.get(pos).copied())
+            else {
+                continue;
             };
 
             let vote_id = match slot_data.vote_ids.get(pos) {
@@ -511,7 +533,7 @@ impl Engine {
             let attestation_slot = current_slot;
             let block_root = vote.head_root;
 
-            if offset == 0 {
+            if arrival_slot == current_slot {
                 // Inject immediately
                 immediate.push(PendingAttestation {
                     validator_index,
@@ -520,9 +542,8 @@ impl Engine {
                 });
             } else {
                 // Buffer for later injection
-                let future_slot = current_slot + offset as u64;
                 self.pending_xatu_attestations
-                    .entry(future_slot)
+                    .entry(arrival_slot)
                     .or_default()
                     .push(PendingAttestation {
                         validator_index,
@@ -560,7 +581,9 @@ impl Engine {
     fn build_slot_result(
         &mut self,
         slot: Slot,
+        eval_slot: Slot,
         has_block: bool,
+        block_root: Option<Hash256>,
         num_attestations_injected: u64,
         attestation_source: &str,
     ) -> SlotResult {
@@ -582,17 +605,26 @@ impl Engine {
                 (Hash256::ZERO, 0)
             };
 
-        let delay = slot.as_u64().saturating_sub(confirmed_slot);
+        let delay = eval_slot.as_u64().saturating_sub(confirmed_slot);
+        let fast_confirmed = confirmed_root != Hash256::ZERO && confirmed_slot == slot.as_u64();
+        let strict_one_slot_confirmed = has_block
+            && confirmed_root != Hash256::ZERO
+            && block_root == Some(confirmed_root)
+            && confirmed_slot == slot.as_u64()
+            && delay == 1;
         let epoch = slot.as_u64() / 32;
 
         SlotResult {
             slot: slot.as_u64(),
+            eval_slot: eval_slot.as_u64(),
             epoch,
             has_block,
-            block_root: format!("{:?}", head_root),
+            block_root: block_root.map(|root| format!("{:?}", root)),
             confirmed_root: format!("{:?}", confirmed_root),
             confirmed_slot,
             confirmation_delay_slots: delay,
+            fast_confirmed,
+            strict_one_slot_confirmed,
             head_root: format!("{:?}", head_root),
             finalized_epoch,
             justified_epoch,
@@ -602,6 +634,34 @@ impl Engine {
             fcr_eval_duration_us: 0,
             attestation_source: attestation_source.to_string(),
         }
+    }
+}
+
+fn xatu_arrival_slot(attestation_slot: Slot, slot_offset: Option<u8>) -> Option<Slot> {
+    match slot_offset {
+        Some(255) | None => None,
+        Some(offset) => Some(attestation_slot + u64::from(offset)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xatu_arrival_slot_respects_seen_offsets() {
+        let attestation_slot = Slot::new(100);
+
+        assert_eq!(
+            xatu_arrival_slot(attestation_slot, Some(0)),
+            Some(attestation_slot)
+        );
+        assert_eq!(
+            xatu_arrival_slot(attestation_slot, Some(2)),
+            Some(Slot::new(102))
+        );
+        assert_eq!(xatu_arrival_slot(attestation_slot, Some(255)), None);
+        assert_eq!(xatu_arrival_slot(attestation_slot, None), None);
     }
 }
 

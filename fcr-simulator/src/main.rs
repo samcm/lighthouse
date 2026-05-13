@@ -11,10 +11,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use config::Config;
+use serde::Serialize;
 use tracing::info;
+use types::{EthSpec, MainnetEthSpec};
+
+use crate::output::CSV_SCHEMA_HEADER;
+
+const RUN_MANIFEST_SCHEMA_VERSION: u64 = 1;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,6 +60,11 @@ async fn main() -> Result<()> {
         .pre_download(earliest_slot, latest_slot)
         .context("failed to pre-download ERA files")?;
 
+    info!("Pre-fetching genesis state");
+    let spec = MainnetEthSpec::default_spec();
+    beacon::fetch_genesis_state(&config.beacon_node_url, &config.resolved_cache_dir(), &spec)
+        .context("failed to pre-fetch genesis state")?;
+
     if n_workers <= 1 {
         let range = ranges.into_iter().next().unwrap();
         let mut engine =
@@ -61,6 +72,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("failed to initialize engine")?;
         let result = engine.run().await.context("simulation failed")?;
+        write_run_manifest(&config, std::slice::from_ref(&result), &[], &[], false)?;
         log_summary(&[result]);
     } else {
         // Each worker gets a permanent output file and shared progress state
@@ -142,6 +154,9 @@ async fn main() -> Result<()> {
             );
         }
 
+        let partial = !failures.is_empty();
+        write_run_manifest(&config, &results, &failures, &worker_paths, partial)?;
+
         // Merge successful worker outputs
         let successful_paths: Vec<_> = worker_paths
             .iter()
@@ -150,12 +165,19 @@ async fn main() -> Result<()> {
             .map(|(_, p)| p.clone())
             .collect();
 
-        if !successful_paths.is_empty() {
-            merge_csv_outputs(&successful_paths, &config.output)?;
-            log_summary(&results);
-        } else {
-            tracing::error!("All workers failed. No output produced.");
+        if successful_paths.is_empty() {
+            bail!("all workers failed; no output produced");
         }
+
+        if partial && !config.allow_partial {
+            bail!(
+                "{} worker(s) failed; rerun with --allow-partial to merge successful worker output",
+                failures.len()
+            );
+        }
+
+        merge_csv_outputs(&successful_paths, &config.output)?;
+        log_summary(&results);
     }
 
     Ok(())
@@ -233,26 +255,121 @@ fn merge_csv_outputs(worker_paths: &[PathBuf], output: &PathBuf) -> Result<()> {
         .with_context(|| format!("failed to create {}", output.display()))?;
 
     let mut header_written = false;
+    let mut expected_csv_header = None;
 
     for path in worker_paths {
         let file = std::fs::File::open(path)
             .with_context(|| format!("failed to open worker output {}", path.display()))?;
-        let reader = BufReader::new(file);
+        let mut lines = BufReader::new(file).lines();
 
-        for (line_num, line) in reader.lines().enumerate() {
-            let line = line?;
-            if line_num == 0 {
-                if !header_written {
-                    writeln!(out, "{}", line)?;
-                    header_written = true;
-                }
-            } else {
-                writeln!(out, "{}", line)?;
-            }
+        let schema_header = lines
+            .next()
+            .transpose()?
+            .with_context(|| format!("worker output {} is empty", path.display()))?;
+        if schema_header != CSV_SCHEMA_HEADER {
+            bail!(
+                "worker output {} has CSV schema header '{}', expected '{}'",
+                path.display(),
+                schema_header,
+                CSV_SCHEMA_HEADER
+            );
+        }
+
+        let csv_header = lines
+            .next()
+            .transpose()?
+            .with_context(|| format!("worker output {} missing CSV header", path.display()))?;
+
+        if !header_written {
+            writeln!(out, "{}", schema_header)?;
+            writeln!(out, "{}", csv_header)?;
+            expected_csv_header = Some(csv_header);
+            header_written = true;
+        } else if expected_csv_header.as_ref() != Some(&csv_header) {
+            bail!("worker output {} has mismatched CSV header", path.display());
+        }
+
+        for line in lines {
+            writeln!(out, "{}", line?)?;
         }
     }
 
     Ok(())
+}
+
+#[derive(Serialize)]
+struct RunManifest {
+    schema_version: u64,
+    requested_start_slot: u64,
+    requested_end_slot: u64,
+    allow_partial: bool,
+    partial: bool,
+    failed_workers: Vec<usize>,
+    completed_ranges: Vec<CompletedRange>,
+}
+
+#[derive(Serialize)]
+struct CompletedRange {
+    worker_id: u64,
+    start_slot: u64,
+    end_slot: u64,
+    total_slots: u64,
+    source_path: String,
+}
+
+fn write_run_manifest(
+    config: &Config,
+    results: &[sim::WorkerResult],
+    failed_workers: &[usize],
+    worker_paths: &[PathBuf],
+    partial: bool,
+) -> Result<()> {
+    let completed_ranges = results
+        .iter()
+        .map(|result| {
+            let source_path = worker_paths
+                .get(result.worker_id as usize)
+                .unwrap_or(&config.output);
+
+            CompletedRange {
+                worker_id: result.worker_id,
+                start_slot: result.start_slot,
+                end_slot: result.end_slot,
+                total_slots: result.total_slots,
+                source_path: source_path.display().to_string(),
+            }
+        })
+        .collect();
+
+    let manifest = RunManifest {
+        schema_version: RUN_MANIFEST_SCHEMA_VERSION,
+        requested_start_slot: config.start_slot(),
+        requested_end_slot: config.end_slot(),
+        allow_partial: config.allow_partial,
+        partial,
+        failed_workers: failed_workers.to_vec(),
+        completed_ranges,
+    };
+
+    let path = manifest_path(&config.output);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("failed to create manifest {}", path.display()))?;
+    serde_json::to_writer_pretty(file, &manifest)
+        .with_context(|| format!("failed to write manifest {}", path.display()))?;
+
+    info!(manifest = %path.display(), "Wrote run manifest");
+    Ok(())
+}
+
+fn manifest_path(output: &PathBuf) -> PathBuf {
+    let manifest_name = output
+        .file_name()
+        .map(|name| format!("{}.manifest.json", name.to_string_lossy()))
+        .unwrap_or_else(|| "results.csv.manifest.json".to_string());
+    output.with_file_name(manifest_name)
 }
 
 fn log_summary(results: &[sim::WorkerResult]) {

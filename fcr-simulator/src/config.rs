@@ -53,6 +53,11 @@ pub struct Config {
     /// Downloads daily parquet files from R2 with per-validator timing information.
     #[arg(long)]
     pub use_xatu_attestations: bool,
+
+    /// Merge and exit successfully when one or more parallel workers fail.
+    /// Without this flag, any worker failure causes a non-zero exit.
+    #[arg(long)]
+    pub allow_partial: bool,
 }
 
 impl Config {

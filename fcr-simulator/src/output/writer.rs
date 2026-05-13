@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::config::OutputFormat;
-use crate::output::SlotResult;
+use crate::output::{CSV_SCHEMA_HEADER, SlotResult};
 
 pub struct OutputWriter {
     format: OutputFormat,
@@ -20,7 +20,9 @@ impl OutputWriter {
             OutputFormat::Csv => {
                 let file = File::create(path)
                     .with_context(|| format!("failed to create output file: {}", path.display()))?;
-                let writer = csv::Writer::from_writer(BufWriter::new(file));
+                let mut writer = BufWriter::new(file);
+                writeln!(writer, "{CSV_SCHEMA_HEADER}")?;
+                let writer = csv::Writer::from_writer(writer);
                 Ok(Self {
                     format: format.clone(),
                     csv_writer: Some(writer),

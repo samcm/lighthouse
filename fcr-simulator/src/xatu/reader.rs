@@ -12,6 +12,15 @@ use types::Hash256;
 
 use super::downloader::XatuDownloader;
 
+const XATU_SCHEMA_MAGIC: &str = "fcr_attestation_timing";
+const XATU_SCHEMA_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitteeOrder {
+    Numeric,
+    Lexicographic,
+}
+
 /// A distinct vote tuple from xatu data.
 #[derive(Debug, Clone)]
 pub struct Vote {
@@ -29,6 +38,8 @@ pub struct SlotAttestationData {
     pub vote_ids: Vec<u8>,
     /// Distinct vote tuples for this slot.
     pub votes: Vec<Vote>,
+    /// Committee order used to flatten `slot_offsets` and `vote_ids`.
+    pub committee_order: CommitteeOrder,
 }
 
 /// Reads and caches xatu attestation timing data from parquet files.
@@ -114,6 +125,7 @@ fn parse_parquet_file(path: &Path) -> Result<HashMap<u64, SlotAttestationData>> 
         let batch = batch_result.context("failed to read parquet batch")?;
         let num_rows = batch.num_rows();
         let schema = batch.schema();
+        let xatu_schema = detect_xatu_schema(&batch)?;
 
         // Get column indices
         let slot_idx = schema.index_of("slot").context("missing 'slot' column")?;
@@ -157,15 +169,18 @@ fn parse_parquet_file(path: &Path) -> Result<HashMap<u64, SlotAttestationData>> 
             let slot_offsets = extract_u8_list(&offsets_arr)
                 .with_context(|| format!("failed to parse slot_offsets for slot {}", slot))?;
 
-            // Parse vote_ids: list[u8]
-            // v1 parquets have an off-by-one: dense_rank included NULL rows,
-            // so non-255 vote_ids are shifted up by 1. Fix on load.
+            // Parse vote_ids: list[u8]. Legacy v1 parquets are 1-based with
+            // 255 as the no-vote sentinel; schema v2 is zero-based.
             let vote_ids_arr = vote_ids_col.value(row);
-            let vote_ids: Vec<u8> = extract_u8_list(&vote_ids_arr)
-                .with_context(|| format!("failed to parse vote_ids for slot {}", slot))?
-                .into_iter()
-                .map(|id| if id == 255 { 255 } else { id.saturating_sub(1) })
-                .collect();
+            let mut vote_ids = extract_u8_list(&vote_ids_arr)
+                .with_context(|| format!("failed to parse vote_ids for slot {}", slot))?;
+            if xatu_schema.committee_order == CommitteeOrder::Numeric {
+                vote_ids.iter_mut().for_each(|id| {
+                    if *id != 255 {
+                        *id = id.saturating_sub(1);
+                    }
+                });
+            }
 
             // Parse votes: list[struct{head_root, source_epoch, source_root, target_epoch, target_root}]
             let votes_arr = votes_col.value(row);
@@ -178,12 +193,62 @@ fn parse_parquet_file(path: &Path) -> Result<HashMap<u64, SlotAttestationData>> 
                     slot_offsets,
                     vote_ids,
                     votes,
+                    committee_order: xatu_schema.committee_order,
                 },
             );
         }
     }
 
     Ok(slot_data)
+}
+
+struct XatuSchema {
+    committee_order: CommitteeOrder,
+}
+
+fn detect_xatu_schema(batch: &arrow::record_batch::RecordBatch) -> Result<XatuSchema> {
+    let schema = batch.schema();
+    let magic_idx = schema.index_of("schema_magic").ok();
+    let version_idx = schema.index_of("schema_version").ok();
+
+    match (magic_idx, version_idx) {
+        (None, None) => Ok(XatuSchema {
+            committee_order: CommitteeOrder::Numeric,
+        }),
+        (Some(magic_idx), Some(version_idx)) => {
+            let magic_col = batch
+                .column(magic_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("'schema_magic' column is not String")?;
+            let version_col = batch
+                .column(version_idx)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .context("'schema_version' column is not UInt8")?;
+
+            for row in 0..batch.num_rows() {
+                let magic = magic_col.value(row);
+                let version = version_col.value(row);
+                if magic != XATU_SCHEMA_MAGIC || version != XATU_SCHEMA_VERSION {
+                    bail!(
+                        "unsupported xatu parquet schema: magic='{}' version={} (expected '{}' version {})",
+                        magic,
+                        version,
+                        XATU_SCHEMA_MAGIC,
+                        XATU_SCHEMA_VERSION
+                    );
+                }
+            }
+
+            Ok(XatuSchema {
+                committee_order: CommitteeOrder::Lexicographic,
+            })
+        }
+        _ => bail!(
+            "xatu parquet schema must contain both schema_magic and schema_version, or neither for legacy v1"
+        ),
+    }
 }
 
 /// Extract a Vec<u8> from an Arrow array that should be a UInt8Array.

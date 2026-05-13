@@ -1,4 +1,4 @@
 mod downloader;
 mod reader;
 
-pub use reader::XatuReader;
+pub use reader::{CommitteeOrder, XatuReader};

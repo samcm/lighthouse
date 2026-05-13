@@ -35,7 +35,7 @@
 use crate::metrics;
 use proto_array::core::{ProtoArray, VoteTracker};
 use std::collections::{BTreeSet, HashMap};
-use tracing::{debug, debug_span};
+use tracing::{debug, debug_span, info};
 use types::{BeaconState, Checkpoint, Epoch, EthSpec, Hash256, RelativeEpoch, Slot};
 
 #[derive(Debug, strum::IntoStaticStr)]
@@ -931,7 +931,7 @@ impl FastConfirmationRule {
         }
 
         if confirmed_root != latest_confirmed_root {
-            debug!(
+            info!(
                 confirmed = %confirmed_root,
                 prev = %latest_confirmed_root,
                 "FCR advanced"

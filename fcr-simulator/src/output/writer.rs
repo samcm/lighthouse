@@ -4,102 +4,39 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::config::OutputFormat;
-use crate::output::{CSV_SCHEMA_HEADER, SlotResult};
+use crate::output::SlotResult;
 
 pub struct OutputWriter {
-    format: OutputFormat,
-    csv_writer: Option<csv::Writer<BufWriter<File>>>,
-    json_file: Option<BufWriter<File>>,
-    first_json_record: bool,
+    writer: BufWriter<File>,
 }
 
 impl OutputWriter {
-    pub fn new(path: &Path, format: &OutputFormat) -> Result<Self> {
-        match format {
-            OutputFormat::Csv => {
-                let file = File::create(path)
-                    .with_context(|| format!("failed to create output file: {}", path.display()))?;
-                let mut writer = BufWriter::new(file);
-                writeln!(writer, "{CSV_SCHEMA_HEADER}")?;
-                let writer = csv::Writer::from_writer(writer);
-                Ok(Self {
-                    format: format.clone(),
-                    csv_writer: Some(writer),
-                    json_file: None,
-                    first_json_record: true,
-                })
-            }
-            OutputFormat::Json => {
-                let file = File::create(path)
-                    .with_context(|| format!("failed to create output file: {}", path.display()))?;
-                let mut writer = BufWriter::new(file);
-                writer.write_all(b"[\n")?;
-                Ok(Self {
-                    format: format.clone(),
-                    csv_writer: None,
-                    json_file: Some(writer),
-                    first_json_record: true,
-                })
-            }
-        }
+    pub fn new(path: &Path) -> Result<Self> {
+        let file = File::create(path)
+            .with_context(|| format!("failed to create output file: {}", path.display()))?;
+
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
     }
 
     pub fn write(&mut self, result: &SlotResult) -> Result<()> {
-        match self.format {
-            OutputFormat::Csv => {
-                self.csv_writer
-                    .as_mut()
-                    .expect("csv writer should exist")
-                    .serialize(result)
-                    .context("failed to write CSV record")?;
-            }
-            OutputFormat::Json => {
-                let writer = self.json_file.as_mut().expect("json writer should exist");
-                if !self.first_json_record {
-                    writer.write_all(b",\n")?;
-                }
-                self.first_json_record = false;
-                serde_json::to_writer(&mut *writer, result)?;
-            }
-        }
+        serde_json::to_writer(&mut self.writer, result).context("failed to write JSONL record")?;
+        self.writer
+            .write_all(b"\n")
+            .context("failed to write JSONL newline")?;
         Ok(())
     }
 
-    /// Flush to disk periodically so we don't lose progress on crash.
+    /// Flush to disk periodically so the orchestrator can salvage partial output.
     pub fn flush_if_needed(&mut self, records_written: u64) -> Result<()> {
         if records_written.is_multiple_of(100) {
-            self.flush_inner()?;
+            self.flush()?;
         }
         Ok(())
     }
 
-    /// Final flush.
     pub fn flush(&mut self) -> Result<()> {
-        if let OutputFormat::Json = self.format {
-            let writer = self.json_file.as_mut().expect("json writer should exist");
-            writer.write_all(b"\n]\n")?;
-        }
-        self.flush_inner()
-    }
-
-    fn flush_inner(&mut self) -> Result<()> {
-        match self.format {
-            OutputFormat::Csv => {
-                self.csv_writer
-                    .as_mut()
-                    .expect("csv writer should exist")
-                    .flush()
-                    .context("failed to flush CSV writer")?;
-            }
-            OutputFormat::Json => {
-                self.json_file
-                    .as_mut()
-                    .expect("json writer should exist")
-                    .flush()
-                    .context("failed to flush JSON writer")?;
-            }
-        }
-        Ok(())
+        self.writer.flush().context("failed to flush JSONL writer")
     }
 }

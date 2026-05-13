@@ -1,124 +1,138 @@
-use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Result, bail};
+use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "fcr-simulator")]
-#[command(about = "Simulate Ethereum's Fast Confirmation Rule against historical data")]
+#[command(name = "fcr-lighthouse")]
+#[command(about = "Lighthouse FCR simulation engine")]
 pub struct Config {
-    /// Beacon node URL for fetching the starting state
+    /// Orchestrator HTTP server URL.
     #[arg(long)]
-    pub beacon_node_url: String,
+    pub beacon_node_url: Option<String>,
 
-    /// Start epoch (inclusive)
+    /// First sim slot to record, inclusive.
     #[arg(long)]
-    pub start_epoch: u64,
+    pub start_slot: Option<u64>,
 
-    /// End epoch (exclusive)
+    /// Sim slot exclusive upper bound.
     #[arg(long)]
-    pub end_epoch: u64,
+    pub end_slot: Option<u64>,
 
-    /// ERA file download URL
-    #[arg(long, default_value = "https://mainnet.era.nimbus.team")]
-    pub era_url: String,
+    /// Slot at which to bootstrap from the checkpoint state.
+    #[arg(long)]
+    pub warmup_start_slot: Option<u64>,
 
-    /// Local cache directory for ERA files and beacon states
-    #[arg(long, default_value = "~/.cache/fcr-simulator")]
-    pub cache_dir: PathBuf,
+    /// Ethereum network identifier.
+    #[arg(long, value_enum)]
+    pub network: Option<Network>,
 
-    /// Output file path
-    #[arg(long, default_value = "results.csv")]
-    pub output: PathBuf,
-
-    /// Output format
-    #[arg(long, default_value = "csv")]
-    pub output_format: OutputFormat,
-
-    /// Byzantine threshold percentage (0-25)
-    #[arg(long, default_value = "25")]
+    /// FCR byzantine threshold in percent.
+    #[arg(long, default_value_t = 25)]
     pub byzantine_threshold: u64,
 
-    /// Number of warmup epochs before each worker's start_epoch.
-    /// More warmup = more reliable FCR results. Attestation weight
-    /// falls off with distance, so 10 epochs covers the meaningful range.
-    #[arg(long, default_value = "10")]
-    pub warmup_epochs: u64,
+    /// Attestation source planning mode used by the orchestrator.
+    #[arg(long, value_enum)]
+    pub attestation_source_mode: Option<AttestationSourceMode>,
 
-    /// Number of parallel workers. Each worker processes a chunk of the
-    /// epoch range independently with its own BeaconChain instance.
-    /// Each worker uses ~2GB RAM for the BeaconState.
-    #[arg(long, default_value = "1")]
-    pub parallel: u64,
-
-    /// Use real attestation timing data from xatu instead of next-block attestations.
-    /// Downloads daily parquet files from R2 with per-validator timing information.
+    /// Lookahead cap used by the orchestrator.
     #[arg(long)]
-    pub use_xatu_attestations: bool,
+    pub lookahead_cap: Option<u64>,
 
-    /// Merge and exit successfully when one or more parallel workers fail.
-    /// Without this flag, any worker failure causes a non-zero exit.
+    /// Path to write JSONL output.
     #[arg(long)]
-    pub allow_partial: bool,
+    pub output: Option<PathBuf>,
+
+    /// Print the engine manifest JSON to stdout and exit.
+    #[arg(long)]
+    pub manifest_json: bool,
 }
 
 impl Config {
-    pub fn resolved_cache_dir(&self) -> PathBuf {
-        let path = self.cache_dir.to_string_lossy();
-        if path.starts_with("~/")
-            && let Some(home) = dirs_fallback()
-        {
-            return home.join(&path[2..]);
+    pub fn validate(&self) -> Result<()> {
+        if self.manifest_json {
+            return Ok(());
         }
-        self.cache_dir.clone()
+
+        let start_slot = self.required_u64(self.start_slot, "--start-slot")?;
+        let end_slot = self.required_u64(self.end_slot, "--end-slot")?;
+        let warmup_start_slot = self.required_u64(self.warmup_start_slot, "--warmup-start-slot")?;
+
+        self.required_str(self.beacon_node_url.as_deref(), "--beacon-node-url")?;
+        self.required(self.network, "--network")?;
+        self.required(self.attestation_source_mode, "--attestation-source-mode")?;
+        self.required_u64(self.lookahead_cap, "--lookahead-cap")?;
+        self.required_path(self.output.as_deref(), "--output")?;
+
+        if warmup_start_slot > start_slot {
+            bail!("--warmup-start-slot must be <= --start-slot");
+        }
+
+        if start_slot >= end_slot {
+            bail!("--start-slot must be < --end-slot");
+        }
+
+        Ok(())
     }
 
-    #[allow(dead_code)]
+    pub fn beacon_node_url(&self) -> &str {
+        self.beacon_node_url
+            .as_deref()
+            .expect("validated config should include --beacon-node-url")
+    }
+
     pub fn start_slot(&self) -> u64 {
-        self.start_epoch * 32
+        self.start_slot
+            .expect("validated config should include --start-slot")
     }
 
-    #[allow(dead_code)]
     pub fn end_slot(&self) -> u64 {
-        self.end_epoch * 32
+        self.end_slot
+            .expect("validated config should include --end-slot")
     }
 
-    #[allow(dead_code)]
     pub fn warmup_start_slot(&self) -> u64 {
-        self.start_epoch.saturating_sub(self.warmup_epochs) * 32
+        self.warmup_start_slot
+            .expect("validated config should include --warmup-start-slot")
     }
 
-    /// Split the epoch range into N chunks for parallel workers.
-    /// Returns (start_epoch, end_epoch) for each chunk.
-    pub fn split_ranges(&self) -> Vec<(u64, u64)> {
-        let total_epochs = self.end_epoch.saturating_sub(self.start_epoch);
-        let n = self.parallel.max(1);
+    pub fn network(&self) -> Network {
+        self.network
+            .expect("validated config should include --network")
+    }
 
-        if total_epochs == 0 || n == 0 {
-            return vec![];
-        }
+    pub fn output(&self) -> &Path {
+        self.output
+            .as_deref()
+            .expect("validated config should include --output")
+    }
 
-        let chunk_size = total_epochs / n;
-        let remainder = total_epochs % n;
+    fn required_str<'a>(&self, value: Option<&'a str>, flag: &str) -> Result<&'a str> {
+        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
+    }
 
-        let mut ranges = Vec::with_capacity(n as usize);
-        let mut cursor = self.start_epoch;
+    fn required_path<'a>(&self, value: Option<&'a Path>, flag: &str) -> Result<&'a Path> {
+        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
+    }
 
-        for i in 0..n {
-            let extra = if i < remainder { 1 } else { 0 };
-            let end = cursor + chunk_size + extra;
-            ranges.push((cursor, end));
-            cursor = end;
-        }
+    fn required<T: Copy>(&self, value: Option<T>, flag: &str) -> Result<T> {
+        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
+    }
 
-        ranges
+    fn required_u64(&self, value: Option<u64>, flag: &str) -> Result<u64> {
+        value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
     }
 }
 
-fn dirs_fallback() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Network {
+    Mainnet,
 }
 
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum OutputFormat {
-    Csv,
-    Json,
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AttestationSourceMode {
+    #[value(name = "next-non-missed")]
+    NextNonMissed,
+    #[value(name = "strict-source-block-k-minus-1")]
+    StrictSourceBlockKMinus1,
 }

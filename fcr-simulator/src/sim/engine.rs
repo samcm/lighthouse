@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use beacon_chain::builder::BeaconChainBuilder;
 use beacon_chain::chain_config::ChainConfig;
 use beacon_chain::migrate::MigratorConfig;
@@ -17,273 +16,172 @@ use store::{HotColdDB, StoreConfig};
 use task_executor::test_utils::TestRuntime;
 use tracing::{debug, info, warn};
 use types::{
-    BlockImportSource, ChainSpec, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock, Slot,
+    BeaconState, BlockImportSource, ChainSpec, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock,
+    Slot,
 };
 
-use crate::beacon;
-use crate::config::Config;
-use crate::era::{EraBlockIterator, EraDownloader};
+use crate::config::{Config, Network};
+use crate::http::{AttestationPlan, BeaconFetcher, fetch_attestation_plan};
 use crate::output::{OutputWriter, SlotResult};
-use crate::xatu::{CommitteeOrder, XatuReader};
 
 type T = DiskHarnessType<MainnetEthSpec>;
 
-pub struct WorkerResult {
-    pub worker_id: u64,
-    pub start_slot: u64,
-    pub end_slot: u64,
-    pub total_slots: u64,
-    pub duration_secs: f64,
-}
-
-/// Shared progress state for a single worker. Updated atomically by the worker,
-/// read by the progress reporter.
-pub struct WorkerProgress {
-    pub worker_id: AtomicU64,
-    pub current_slot: AtomicU64,
-    pub start_slot: AtomicU64,
-    pub end_slot: AtomicU64,
-    pub confirmed: AtomicU64,
-    pub total_recorded: AtomicU64,
-}
-
-impl WorkerProgress {
-    pub fn new(worker_id: u64, start_slot: u64, end_slot: u64) -> Self {
-        Self {
-            worker_id: AtomicU64::new(worker_id),
-            current_slot: AtomicU64::new(start_slot),
-            start_slot: AtomicU64::new(start_slot),
-            end_slot: AtomicU64::new(end_slot),
-            confirmed: AtomicU64::new(0),
-            total_recorded: AtomicU64::new(0),
-        }
-    }
-}
-
-/// A pending attestation to inject at a future slot.
-struct PendingAttestation {
-    validator_index: usize,
-    block_root: Hash256,
-    attestation_slot: Slot,
-}
-
 pub struct Engine {
     chain: Arc<BeaconChain<T>>,
-    era_blocks: EraBlockIterator,
+    block_fetcher: BeaconFetcher,
+    block_cache: HashMap<Slot, Option<SignedBeaconBlock<MainnetEthSpec>>>,
+    plan: AttestationPlan,
     output: OutputWriter,
     config: EngineConfig,
-    progress: Option<Arc<WorkerProgress>>,
-    /// Xatu attestation reader, present when --use-xatu-attestations is set
-    xatu_reader: Option<XatuReader>,
-    /// Buffer of pending xatu attestations: maps injection_slot -> attestations
-    pending_xatu_attestations: BTreeMap<Slot, Vec<PendingAttestation>>,
     _runtime: TestRuntime,
     _db_dir: tempfile::TempDir,
 }
 
 struct EngineConfig {
-    worker_id: u64,
     start_slot: Slot,
     end_slot: Slot,
     warmup_start_slot: Slot,
-    use_xatu_attestations: bool,
 }
 
 impl Engine {
-    /// Create an engine for a specific epoch range (used by parallel workers).
-    pub async fn new_for_range(
-        config: &Config,
-        start_epoch: u64,
-        end_epoch: u64,
-        output_path: std::path::PathBuf,
-        progress: Option<Arc<WorkerProgress>>,
-    ) -> Result<Self> {
-        let spec = Arc::new(MainnetEthSpec::default_spec());
-        let cache_dir = config.resolved_cache_dir();
+    pub async fn new(config: &Config) -> Result<Self> {
+        let spec = Arc::new(match config.network() {
+            Network::Mainnet => MainnetEthSpec::default_spec(),
+        });
 
-        let start_slot = Slot::new(start_epoch * 32);
-        let end_slot = Slot::new(end_epoch * 32);
-        let warmup_start_slot = Slot::new(start_epoch.saturating_sub(config.warmup_epochs) * 32);
+        let start_slot = Slot::new(config.start_slot());
+        let end_slot = Slot::new(config.end_slot());
+        let warmup_start_slot = Slot::new(config.warmup_start_slot());
 
         info!(
-            warmup_start_slot = %warmup_start_slot,
-            start_slot = %start_slot,
-            end_slot = %end_slot,
-            warmup_slots = warmup_start_slot.as_u64().abs_diff(start_slot.as_u64()),
-            use_xatu = config.use_xatu_attestations,
-            "Initializing worker"
+            %warmup_start_slot,
+            %start_slot,
+            %end_slot,
+            "Initializing Lighthouse FCR engine"
         );
 
-        // Fetch checkpoint state, block, and genesis state from beacon node
-        let mut checkpoint_state = beacon::fetch_beacon_state(
-            &config.beacon_node_url,
-            warmup_start_slot,
-            &cache_dir,
-            &spec,
-        )
-        .context("failed to fetch checkpoint state")?;
+        let block_fetcher = BeaconFetcher::new(config.beacon_node_url(), spec.clone())
+            .context("failed to create HTTP block fetcher")?;
 
-        let checkpoint_block = beacon::fetch_checkpoint_block(
-            &config.beacon_node_url,
-            &mut checkpoint_state,
-            &cache_dir,
-            &spec,
-        )
-        .context("failed to fetch checkpoint block")?;
+        let mut checkpoint_state = block_fetcher
+            .fetch_checkpoint_state(warmup_start_slot)
+            .await
+            .context("failed to fetch checkpoint state")?;
+        let checkpoint_state_root = checkpoint_state
+            .canonical_root()
+            .map_err(|e| anyhow::anyhow!("failed to calculate checkpoint state root: {:?}", e))?;
+        let checkpoint_block_root = checkpoint_state.get_latest_block_root(checkpoint_state_root);
 
-        let genesis_state = beacon::fetch_genesis_state(&config.beacon_node_url, &cache_dir, &spec)
+        let checkpoint_block = block_fetcher
+            .fetch_block_by_root(checkpoint_block_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to fetch checkpoint block by root {:?}",
+                    checkpoint_block_root
+                )
+            })?;
+
+        let genesis_state = block_fetcher
+            .fetch_genesis_state()
+            .await
             .context("failed to fetch genesis state")?;
 
-        // Build headless BeaconChain
         info!("Building headless BeaconChain");
-        let worker_id = progress
-            .as_ref()
-            .map(|p| p.worker_id.load(Ordering::Relaxed))
-            .unwrap_or(0);
         let (chain, runtime, db_dir) = build_chain(
             checkpoint_state,
             checkpoint_block,
             genesis_state,
             &spec,
             config,
-            &cache_dir,
-            worker_id,
         )
         .context("failed to build BeaconChain")?;
 
-        // Set up ERA block iterator
-        let downloader = EraDownloader::new(&config.era_url, &cache_dir)
-            .context("failed to create ERA downloader")?;
-        let era_blocks = EraBlockIterator::new(downloader, (*spec).clone());
+        let plan =
+            fetch_attestation_plan(config.beacon_node_url(), warmup_start_slot + 1, end_slot)
+                .await
+                .context("failed to fetch attestation plan")?;
 
-        // Set up output writer
-        let output = OutputWriter::new(&output_path, &config.output_format)
-            .context("failed to create output writer")?;
+        let mut sim_slot = warmup_start_slot + 1;
+        while sim_slot < end_slot {
+            if !plan.contains_key(&sim_slot) {
+                bail!(
+                    "attestation plan is missing sim_slot {}; orchestrator served an incomplete plan",
+                    sim_slot
+                );
+            }
+            sim_slot += 1;
+        }
 
-        // Set up xatu reader if requested
-        let xatu_reader = if config.use_xatu_attestations {
-            Some(XatuReader::new(&cache_dir).context("failed to create xatu reader")?)
-        } else {
-            None
-        };
+        let output =
+            OutputWriter::new(config.output()).context("failed to create JSONL output writer")?;
 
         Ok(Self {
             chain,
-            era_blocks,
+            block_fetcher,
+            block_cache: HashMap::new(),
+            plan,
             output,
             config: EngineConfig {
-                worker_id,
                 start_slot,
                 end_slot,
                 warmup_start_slot,
-                use_xatu_attestations: config.use_xatu_attestations,
             },
-            progress,
-            xatu_reader,
-            pending_xatu_attestations: BTreeMap::new(),
             _runtime: runtime,
             _db_dir: db_dir,
         })
     }
 
-    pub async fn run(&mut self) -> Result<WorkerResult> {
-        let total_slots = self.config.end_slot.as_u64() - self.config.warmup_start_slot.as_u64();
-        let recording_start = self.config.start_slot;
-
+    pub async fn run(&mut self) -> Result<()> {
         let mut slot = self.config.warmup_start_slot + 1;
-        let mut processed = 0u64;
         let mut total_recorded = 0u64;
-        let mut first_recorded_slot = None;
-        let mut last_recorded_slot = None;
-        let batch_start = Instant::now();
+        let run_start = Instant::now();
 
         while slot < self.config.end_slot {
-            let is_recording = slot >= recording_start;
+            let is_recording = slot >= self.config.start_slot;
 
             self.chain.slot_clock.set_slot(slot.as_u64());
 
-            // Get block for this slot from ERA files
-            let block_at_slot = self.era_blocks.block_at_slot(slot)?.cloned();
-            let block_root = block_at_slot.as_ref().map(|block| block.canonical_root());
+            let block_at_slot = self.get_block_at_slot(slot).await?;
             let has_block = block_at_slot.is_some();
+            let block_root = block_at_slot.as_ref().map(|block| block.canonical_root());
 
-            // Process block if it exists
             if let Some(ref block) = block_at_slot {
-                self.process_block(block).await.with_context(|| {
-                    format!("failed to process canonical block at slot {}", slot)
-                })?;
+                self.process_block(block)
+                    .await
+                    .with_context(|| format!("failed to process block at slot {}", slot))?;
             }
 
-            // Inject attestations based on the configured source.
-            // During warmup, always use ERA attestations to avoid injecting votes
-            // for non-canonical block roots that corrupt fork choice state.
-            let num_injected = if self.config.use_xatu_attestations && is_recording {
-                self.inject_xatu_attestations(slot)?
+            let source_slot = self.plan.get(&slot).copied().flatten();
+            let num_attestations_injected = if let Some(source_block_slot) = source_slot {
+                self.inject_attestations_from_source_block(slot, source_block_slot)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to inject attestations for sim slot {} from source block {}",
+                            slot, source_block_slot
+                        )
+                    })?
             } else {
-                self.inject_next_block_attestations(slot)?
+                0
             };
 
-            // The spec's on_tick_per_slot_after_attestations_applied evaluates FCR
-            // at slot N+1 with attestations from slot N applied. This matters because
-            // is_one_confirmed computes:
-            //   maximum_support = estimate_committee_weight(parent_slot+1, current_slot-1)
-            // If current_slot == block_slot, that range is empty, maximum_support = 0,
-            // and everything trivially confirms. Evaluating at slot+1 gives the correct
-            // non-zero denominator.
-            //
-            // Note: inject_next_block_attestations already advances fork choice time to
-            // slot+1 via on_attestation, so epoch boundary snapshots are handled correctly.
-            let eval_slot = slot + 1;
-            self.chain.recompute_head_at_slot(eval_slot).await;
+            let fcr_eval_start = Instant::now();
+            self.chain.recompute_head_at_slot(slot + 1).await;
+            let fcr_eval_duration_us = micros_since(fcr_eval_start);
 
             if is_recording {
-                let attestation_source = if self.config.use_xatu_attestations {
-                    "xatu"
-                } else {
-                    "era"
-                };
                 let result = self.build_slot_result(
                     slot,
-                    eval_slot,
                     has_block,
                     block_root,
-                    num_injected,
-                    attestation_source,
+                    source_slot,
+                    num_attestations_injected,
+                    fcr_eval_duration_us,
                 );
                 total_recorded += 1;
-                first_recorded_slot.get_or_insert(slot.as_u64());
-                last_recorded_slot = Some(slot.as_u64());
                 self.output.write(&result)?;
                 self.output.flush_if_needed(total_recorded)?;
-
-                // Update shared progress for the reporter
-                if let Some(ref progress) = self.progress {
-                    progress
-                        .current_slot
-                        .store(slot.as_u64(), Ordering::Relaxed);
-                    progress.confirmed.store(0, Ordering::Relaxed);
-                    progress
-                        .total_recorded
-                        .store(total_recorded, Ordering::Relaxed);
-                }
-            }
-
-            processed += 1;
-
-            if processed.is_multiple_of(1000) {
-                let elapsed = batch_start.elapsed();
-                let slots_per_sec = processed as f64 / elapsed.as_secs_f64();
-                let remaining = total_slots.saturating_sub(processed);
-                let eta_secs = remaining as f64 / slots_per_sec;
-                info!(
-                    slot = %slot,
-                    processed,
-                    total = total_slots,
-                    slots_per_sec = format!("{:.1}", slots_per_sec),
-                    eta_mins = format!("{:.1}", eta_secs / 60.0),
-                    total_recorded,
-                    "Progress"
-                );
             }
 
             slot += 1;
@@ -293,27 +191,32 @@ impl Engine {
 
         info!(
             total_slots = total_recorded,
-            duration_secs = format!("{:.1}", batch_start.elapsed().as_secs_f64()),
-            "Worker complete"
+            duration_secs = format!("{:.1}", run_start.elapsed().as_secs_f64()),
+            "Simulation complete"
         );
 
-        Ok(WorkerResult {
-            worker_id: self.config.worker_id,
-            start_slot: first_recorded_slot.unwrap_or(recording_start.as_u64()),
-            end_slot: last_recorded_slot
-                .map(|slot| slot.saturating_add(1))
-                .unwrap_or(recording_start.as_u64()),
-            total_slots: total_recorded,
-            duration_secs: batch_start.elapsed().as_secs_f64(),
-        })
+        Ok(())
+    }
+
+    async fn get_block_at_slot(
+        &mut self,
+        slot: Slot,
+    ) -> Result<Option<SignedBeaconBlock<MainnetEthSpec>>> {
+        if let Some(block) = self.block_cache.get(&slot) {
+            return Ok(block.clone());
+        }
+
+        let block = self.block_fetcher.fetch_block_at_slot(slot).await?;
+        self.block_cache.insert(slot, block.clone());
+
+        Ok(block)
     }
 
     async fn process_block(&self, block: &SignedBeaconBlock<MainnetEthSpec>) -> Result<()> {
         let block_root = block.canonical_root();
         let block_arc = Arc::new(block.clone());
 
-        // Create AvailableBlock without DA checks - we're replaying historical data
-        // without blob sidecars. Safe because we only care about consensus/FCR.
+        // Historical replay skips DA and EL integration. Blocks are canonical-chain inputs.
         let available_block =
             beacon_chain::data_availability_checker::AvailableBlock::new_without_da_check(
                 block_arc,
@@ -338,26 +241,16 @@ impl Engine {
         Ok(())
     }
 
-    /// Inject attestations from the next block into fork choice (ERA-based approach).
-    ///
-    /// This simulates what a real node would see: the next block's attestations
-    /// arriving during the current slot. If the next slot is missed, we skip
-    /// ahead to find the next actual block (handling consecutive missed slots).
-    fn inject_next_block_attestations(&mut self, current_slot: Slot) -> Result<u64> {
-        // Find the next block. Usually N+1, but skip missed slots.
-        let max_missed = 4u64; // handle up to 4 consecutive missed slots
-        let mut next_block = None;
-
-        for offset in 1..=max_missed {
-            let peek_slot = current_slot + offset;
-            if let Some(block) = self.era_blocks.peek_next_block(peek_slot)? {
-                next_block = Some((peek_slot, block.clone()));
-                break;
-            }
-        }
-
-        let Some((block_slot, block)) = next_block else {
-            return Ok(0);
+    async fn inject_attestations_from_source_block(
+        &mut self,
+        sim_slot: Slot,
+        source_block_slot: Slot,
+    ) -> Result<u64> {
+        let Some(block) = self.get_block_at_slot(source_block_slot).await? else {
+            bail!(
+                "attestation plan referenced missing source block at slot {}",
+                source_block_slot
+            );
         };
 
         let attestation_count = block.message().body().attestations_len();
@@ -367,10 +260,8 @@ impl Engine {
 
         let head_snapshot = self.chain.head_snapshot();
         let head_state = &head_snapshot.beacon_state;
-        let mut ctxt = ConsensusContext::new(block_slot);
+        let mut ctxt = ConsensusContext::new(source_block_slot);
 
-        // Inject ALL attestations from the next block - this is what a real node
-        // would see arriving during the current slot. No slot filtering.
         let mut indexed_attestations = Vec::with_capacity(attestation_count);
         for attestation in block.message().body().attestations() {
             match ctxt.get_indexed_attestation(head_state, attestation) {
@@ -388,16 +279,17 @@ impl Engine {
             return Ok(0);
         }
 
-        let inject_slot = current_slot + 1;
+        let inject_slot = sim_slot + 1;
         let mut fc = self.chain.canonical_head.fork_choice_write_lock();
         let mut injected = 0u64;
 
+        let spec = self.chain.spec.clone();
         for indexed in &indexed_attestations {
             if let Err(e) = fc.on_attestation(
                 inject_slot,
                 indexed.to_ref(),
                 AttestationFromBlock::True,
-                &self.chain.spec,
+                &spec,
             ) {
                 let target_root = indexed.to_ref().data().target.root;
                 let target_in_fc = fc.proto_array().contains_block(&target_root);
@@ -406,7 +298,8 @@ impl Engine {
                 let finalized = fc.finalized_checkpoint();
                 warn!(
                     error = ?e,
-                    %current_slot,
+                    %sim_slot,
+                    %source_block_slot,
                     ?target_root,
                     target_in_fc,
                     ?head_root,
@@ -423,176 +316,20 @@ impl Engine {
         Ok(injected)
     }
 
-    /// Inject attestations using xatu timing data.
-    ///
-    /// For each slot, we:
-    /// 1. Drain any pending attestations that should arrive at this slot
-    /// 2. Look up xatu data for this slot's committee assignments
-    /// 3. For offset=0 attestations, inject immediately
-    /// 4. For offset>0 attestations, buffer them for injection at slot + offset
-    fn inject_xatu_attestations(&mut self, current_slot: Slot) -> Result<u64> {
-        let mut injected = 0u64;
-
-        // Step 1: Drain pending attestations for this slot
-        let inject_slot = current_slot + 1;
-        if let Some(pending) = self.pending_xatu_attestations.remove(&current_slot) {
-            let mut fc = self.chain.canonical_head.fork_choice_write_lock();
-            if let Err(e) = fc.update_time(inject_slot) {
-                debug!(error = ?e, "Failed to update fork choice time for pending attestations");
-            }
-            for att in &pending {
-                fc.proto_array_mut()
-                    .process_attestation(
-                        att.validator_index,
-                        att.block_root,
-                        att.attestation_slot,
-                        true,
-                    )
-                    .map_err(|e| {
-                        debug!(error = ?e, validator = att.validator_index, "Failed to inject pending xatu attestation");
-                    })
-                    .ok();
-                injected += 1;
-            }
-            drop(fc);
-        }
-
-        // Step 2: Look up xatu data for this slot
-        let Some(xatu_reader) = self.xatu_reader.as_mut() else {
-            return Ok(injected);
-        };
-
-        let slot_data = match xatu_reader.get_slot_data(current_slot.as_u64())? {
-            Some(data) => data.clone(),
-            None => return Ok(injected),
-        };
-
-        // Step 3: Get committee assignments for this slot from the beacon state
-        let head_snapshot = self.chain.head_snapshot();
-        let head_state = &head_snapshot.beacon_state;
-
-        let committees = match head_state.get_beacon_committees_at_slot(current_slot) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    slot = %current_slot,
-                    error = ?e,
-                    "Failed to get committees for xatu attestation injection"
-                );
-                return Ok(injected);
-            }
-        };
-
-        // Build flat validator list matching the xatu parquet committee ordering.
-        let mut indexed_committees: Vec<(usize, &[usize])> = committees
-            .iter()
-            .map(|c| (c.index as usize, c.committee))
-            .collect();
-        match slot_data.committee_order {
-            CommitteeOrder::Numeric => indexed_committees.sort_by_key(|(index, _)| *index),
-            CommitteeOrder::Lexicographic => {
-                indexed_committees.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
-            }
-        }
-
-        let mut validators_in_order: Vec<usize> = Vec::new();
-        for (_, committee) in &indexed_committees {
-            validators_in_order.extend_from_slice(committee);
-        }
-        drop(head_snapshot);
-
-        // Verify lengths match
-        if validators_in_order.len() != slot_data.slot_offsets.len() {
-            warn!(
-                slot = %current_slot,
-                committee_size = validators_in_order.len(),
-                xatu_size = slot_data.slot_offsets.len(),
-                "Committee size mismatch with xatu data, skipping slot"
-            );
-            return Ok(injected);
-        }
-
-        // Step 4: Process each committee position
-        let mut immediate = Vec::new();
-        for (pos, &validator_index) in validators_in_order.iter().enumerate() {
-            let Some(arrival_slot) =
-                xatu_arrival_slot(current_slot, slot_data.slot_offsets.get(pos).copied())
-            else {
-                continue;
-            };
-
-            let vote_id = match slot_data.vote_ids.get(pos) {
-                Some(&255) | None => continue,
-                Some(&id) => id as usize,
-            };
-
-            let Some(vote) = slot_data.votes.get(vote_id) else {
-                continue;
-            };
-
-            let attestation_slot = current_slot;
-            let block_root = vote.head_root;
-
-            if arrival_slot == current_slot {
-                // Inject immediately
-                immediate.push(PendingAttestation {
-                    validator_index,
-                    block_root,
-                    attestation_slot,
-                });
-            } else {
-                // Buffer for later injection
-                self.pending_xatu_attestations
-                    .entry(arrival_slot)
-                    .or_default()
-                    .push(PendingAttestation {
-                        validator_index,
-                        block_root,
-                        attestation_slot,
-                    });
-            }
-        }
-
-        // Inject immediate attestations
-        if !immediate.is_empty() {
-            let mut fc = self.chain.canonical_head.fork_choice_write_lock();
-            if let Err(e) = fc.update_time(inject_slot) {
-                debug!(error = ?e, "Failed to update fork choice time for xatu attestations");
-            }
-            for att in &immediate {
-                fc.proto_array_mut()
-                    .process_attestation(
-                        att.validator_index,
-                        att.block_root,
-                        att.attestation_slot,
-                        true,
-                    )
-                    .map_err(|e| {
-                        debug!(error = ?e, validator = att.validator_index, "Failed to inject xatu attestation");
-                    })
-                    .ok();
-                injected += 1;
-            }
-        }
-
-        Ok(injected)
-    }
-
     fn build_slot_result(
-        &mut self,
+        &self,
         slot: Slot,
-        eval_slot: Slot,
         has_block: bool,
         block_root: Option<Hash256>,
+        source_block_slot: Option<Slot>,
         num_attestations_injected: u64,
-        attestation_source: &str,
+        fcr_eval_duration_us: u64,
     ) -> SlotResult {
         let head = self.chain.head();
         let head_root = head.head_block_root();
         let finalized_epoch = head.finalized_checkpoint().epoch.as_u64();
         let justified_epoch = head.justified_checkpoint().epoch.as_u64();
 
-        // Read FCR state
         let (confirmed_root, confirmed_slot) =
             if let Some(ref fcr_mutex) = self.chain.canonical_head.fast_confirmation {
                 let fcr = fcr_mutex.lock();
@@ -605,74 +342,43 @@ impl Engine {
                 (Hash256::ZERO, 0)
             };
 
-        let delay = eval_slot.as_u64().saturating_sub(confirmed_slot);
         let fast_confirmed = confirmed_root != Hash256::ZERO && confirmed_slot == slot.as_u64();
+        let eval_slot = slot.as_u64().saturating_add(1);
+        let delay = eval_slot.saturating_sub(confirmed_slot);
         let strict_one_slot_confirmed = has_block
             && confirmed_root != Hash256::ZERO
             && block_root == Some(confirmed_root)
             && confirmed_slot == slot.as_u64()
             && delay == 1;
-        let epoch = slot.as_u64() / 32;
 
         SlotResult {
             slot: slot.as_u64(),
-            eval_slot: eval_slot.as_u64(),
-            epoch,
+            epoch: slot.as_u64() / 32,
             has_block,
             block_root: block_root.map(|root| format!("{:?}", root)),
+            head_root: format!("{:?}", head_root),
             confirmed_root: format!("{:?}", confirmed_root),
             confirmed_slot,
             confirmation_delay_slots: delay,
             fast_confirmed,
             strict_one_slot_confirmed,
-            head_root: format!("{:?}", head_root),
             finalized_epoch,
             justified_epoch,
+            source_block_slot: source_block_slot.map(|slot| slot.as_u64()),
             num_attestations_injected,
             is_epoch_boundary: slot.as_u64().is_multiple_of(32),
             is_missed_slot: !has_block,
-            fcr_eval_duration_us: 0,
-            attestation_source: attestation_source.to_string(),
+            fcr_eval_duration_us,
         }
     }
 }
 
-fn xatu_arrival_slot(attestation_slot: Slot, slot_offset: Option<u8>) -> Option<Slot> {
-    match slot_offset {
-        Some(255) | None => None,
-        Some(offset) => Some(attestation_slot + u64::from(offset)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn xatu_arrival_slot_respects_seen_offsets() {
-        let attestation_slot = Slot::new(100);
-
-        assert_eq!(
-            xatu_arrival_slot(attestation_slot, Some(0)),
-            Some(attestation_slot)
-        );
-        assert_eq!(
-            xatu_arrival_slot(attestation_slot, Some(2)),
-            Some(Slot::new(102))
-        );
-        assert_eq!(xatu_arrival_slot(attestation_slot, Some(255)), None);
-        assert_eq!(xatu_arrival_slot(attestation_slot, None), None);
-    }
-}
-
 fn build_chain(
-    checkpoint_state: types::BeaconState<MainnetEthSpec>,
+    checkpoint_state: BeaconState<MainnetEthSpec>,
     checkpoint_block: SignedBeaconBlock<MainnetEthSpec>,
-    genesis_state: types::BeaconState<MainnetEthSpec>,
+    genesis_state: BeaconState<MainnetEthSpec>,
     spec: &Arc<ChainSpec>,
     config: &Config,
-    cache_dir: &std::path::Path,
-    _worker_id: u64,
 ) -> Result<(Arc<BeaconChain<T>>, TestRuntime, tempfile::TempDir)> {
     let runtime = TestRuntime::default();
 
@@ -680,10 +386,7 @@ fn build_chain(
     spec_mut.confirmation_byzantine_threshold = config.byzantine_threshold;
     let spec_arc = Arc::new(spec_mut);
 
-    // Use cache dir for DB storage, not system temp (macOS cleans /tmp aggressively)
-    let db_base = cache_dir.join("db");
-    std::fs::create_dir_all(&db_base)?;
-    let db_dir = tempfile::tempdir_in(&db_base).context("failed to create DB directory")?;
+    let db_dir = tempfile::tempdir().context("failed to create DB directory")?;
     let hot_path = db_dir.path().join("hot");
     let cold_path = db_dir.path().join("cold");
     let blobs_path = db_dir.path().join("blobs");
@@ -726,7 +429,6 @@ fn build_chain(
         .weak_subjectivity_state(checkpoint_state, checkpoint_block, None, genesis_state)
         .map_err(|e| anyhow::anyhow!("weak_subjectivity_state failed: {}", e))?;
 
-    // Create slot clock at checkpoint slot - build() calls slot_clock.now() internally
     let slot_clock = TestingSlotClock::new(
         checkpoint_slot,
         std::time::Duration::from_secs(0),
@@ -738,7 +440,11 @@ fn build_chain(
         .build()
         .map_err(|e| anyhow::anyhow!("BeaconChain build failed: {}", e))?;
 
-    info!(checkpoint_slot = %checkpoint_slot, "BeaconChain initialized from checkpoint");
+    info!(%checkpoint_slot, "BeaconChain initialized from checkpoint");
 
     Ok((Arc::new(chain), runtime, db_dir))
+}
+
+fn micros_since(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }

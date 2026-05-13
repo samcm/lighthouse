@@ -11,6 +11,10 @@ fake_crypto = [
     "state_processing/fake_crypto",
 ]
 
+[[bin]]
+name = "fcr-lighthouse"
+path = "src/main.rs"
+
 [dependencies]
 # Lighthouse crates
 beacon_chain = { workspace = true }
@@ -33,19 +37,14 @@ eth2_network_config = { workspace = true }
 
 # External crates
 anyhow = { workspace = true }
-arrow = { version = "55", default-features = false }
-chrono = "0.4"
 clap = { workspace = true }
-csv = "1"
 futures = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
-parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
 rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-snap = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

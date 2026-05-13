@@ -1797,6 +1797,7 @@ pub fn estimate_committee_weight_between_slots<E: EthSpec>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bls::FixedBytesExtended;
     use types::MainnetEthSpec;
 
     type E = MainnetEthSpec;
@@ -1807,6 +1808,43 @@ mod tests {
         assert!(is_start_slot_at_epoch::<E>(Slot::new(32)));
         assert!(!is_start_slot_at_epoch::<E>(Slot::new(1)));
         assert!(!is_start_slot_at_epoch::<E>(Slot::new(31)));
+    }
+
+    #[test]
+    #[ignore = "documents a potential upstream FCR timing issue; see NOTE below"]
+    fn documents_epoch_boundary_snapshot_using_pre_block_unrealized_checkpoint() {
+        let checkpoint = |epoch: u64, root: u64| Checkpoint {
+            epoch: Epoch::new(epoch),
+            root: Hash256::from_low_u64_be(root),
+        };
+
+        let anchor = checkpoint(0, 1);
+        let mut fcr = FastConfirmationRule::new(anchor, 25, 0);
+
+        let slot_30_unrealized = checkpoint(0, 30);
+        let slot_31_unrealized = checkpoint(1, 31);
+
+        fcr.update_fast_confirmation_variables::<E>(
+            Hash256::from_low_u64_be(30),
+            &slot_30_unrealized,
+            Slot::new(30),
+        );
+
+        // NOTE: Each call to update_fast_confirmation_variables at slot N+1
+        // happens before block N+1 is processed in the simulator, so the snapshot
+        // at N+1 (when N+1 is an epoch boundary) captures unrealized JC as-of slot
+        // N's block, not slot N+1's. Whether this matches the spec's intended
+        // timing is an upstream question for dapplion's FCR implementation.
+        fcr.update_fast_confirmation_variables::<E>(
+            Hash256::from_low_u64_be(32),
+            &slot_31_unrealized,
+            Slot::new(32),
+        );
+
+        assert_eq!(
+            fcr.current_epoch_observed_justified_checkpoint,
+            slot_31_unrealized
+        );
     }
 
     #[test]

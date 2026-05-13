@@ -17,7 +17,7 @@ use store::{HotColdDB, StoreConfig};
 use task_executor::test_utils::TestRuntime;
 use tracing::{debug, info, warn};
 use types::{
-    BlockImportSource, ChainSpec, Epoch, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock, Slot,
+    BlockImportSource, ChainSpec, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock, Slot,
 };
 
 use crate::beacon;
@@ -61,7 +61,7 @@ impl WorkerProgress {
 struct PendingAttestation {
     validator_index: usize,
     block_root: Hash256,
-    target_epoch: Epoch,
+    attestation_slot: Slot,
 }
 
 pub struct Engine {
@@ -375,9 +375,12 @@ impl Engine {
         let mut injected = 0u64;
 
         for indexed in &indexed_attestations {
-            if let Err(e) =
-                fc.on_attestation(inject_slot, indexed.to_ref(), AttestationFromBlock::True)
-            {
+            if let Err(e) = fc.on_attestation(
+                inject_slot,
+                indexed.to_ref(),
+                AttestationFromBlock::True,
+                &self.chain.spec,
+            ) {
                 let target_root = indexed.to_ref().data().target.root;
                 let target_in_fc = fc.proto_array().contains_block(&target_root);
                 let head_root = indexed.to_ref().data().beacon_block_root;
@@ -421,7 +424,12 @@ impl Engine {
             }
             for att in &pending {
                 fc.proto_array_mut()
-                    .process_attestation(att.validator_index, att.block_root, att.target_epoch)
+                    .process_attestation(
+                        att.validator_index,
+                        att.block_root,
+                        att.attestation_slot,
+                        true,
+                    )
                     .map_err(|e| {
                         debug!(error = ?e, validator = att.validator_index, "Failed to inject pending xatu attestation");
                     })
@@ -500,7 +508,7 @@ impl Engine {
                 continue;
             };
 
-            let target_epoch = Epoch::new(vote.target_epoch as u64);
+            let attestation_slot = current_slot;
             let block_root = vote.head_root;
 
             if offset == 0 {
@@ -508,7 +516,7 @@ impl Engine {
                 immediate.push(PendingAttestation {
                     validator_index,
                     block_root,
-                    target_epoch,
+                    attestation_slot,
                 });
             } else {
                 // Buffer for later injection
@@ -519,7 +527,7 @@ impl Engine {
                     .push(PendingAttestation {
                         validator_index,
                         block_root,
-                        target_epoch,
+                        attestation_slot,
                     });
             }
         }
@@ -532,7 +540,12 @@ impl Engine {
             }
             for att in &immediate {
                 fc.proto_array_mut()
-                    .process_attestation(att.validator_index, att.block_root, att.target_epoch)
+                    .process_attestation(
+                        att.validator_index,
+                        att.block_root,
+                        att.attestation_slot,
+                        true,
+                    )
                     .map_err(|e| {
                         debug!(error = ?e, validator = att.validator_index, "Failed to inject xatu attestation");
                     })

@@ -41,11 +41,33 @@ impl BeaconFetcher {
         &self,
         root: Hash256,
     ) -> Result<SignedBeaconBlock<MainnetEthSpec>> {
+        self.fetch_block_by_root_optional(root)
+            .await?
+            .with_context(|| format!("block {:?} was not found", root))
+    }
+
+    pub async fn fetch_block_by_root_optional(
+        &self,
+        root: Hash256,
+    ) -> Result<Option<SignedBeaconBlock<MainnetEthSpec>>> {
         let url = format!("{}/eth/v2/beacon/blocks/{:?}", self.base_url, root);
-        let data = self.fetch_ssz(&url).await?;
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/octet-stream")
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch {}", url))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let data = read_success_body(response, &url).await?;
 
         SignedBeaconBlock::from_ssz_bytes(&data, self.spec.as_ref())
             .map_err(|e| anyhow::anyhow!("failed to decode block SSZ for {:?}: {:?}", root, e))
+            .map(Some)
     }
 
     pub async fn fetch_block_at_slot(

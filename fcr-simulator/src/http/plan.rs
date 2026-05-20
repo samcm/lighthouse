@@ -1,22 +1,61 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use types::Slot;
+use types::{Hash256, Slot};
 
 use crate::http::{base_url, build_client};
 
-pub type AttestationPlan = HashMap<Slot, Option<Slot>>;
+pub type AttestationPlan = HashMap<Slot, PlanEntry>;
 
-#[derive(Deserialize)]
-struct PlanResponse {
-    entries: Vec<PlanEntry>,
+#[derive(Clone)]
+pub struct PlanEntry {
+    pub eval_slot: Slot,
+    pub import_blocks: Vec<PlanBlockImport>,
+    pub attestation_sources: Vec<PlanAttestationSource>,
+    pub source_block_slot: Option<Slot>,
+}
+
+#[derive(Clone)]
+pub struct PlanBlockImport {
+    pub slot: Slot,
+    pub root: Hash256,
+    pub canonical: bool,
+}
+
+#[derive(Clone)]
+pub struct PlanAttestationSource {
+    pub slot: Slot,
+    pub max_attestation_slot: Option<Slot>,
 }
 
 #[derive(Deserialize)]
-struct PlanEntry {
+struct PlanResponse {
+    version: Option<u64>,
+    entries: Vec<PlanEntryWire>,
+}
+
+#[derive(Deserialize)]
+struct PlanEntryWire {
     sim_slot: u64,
+    eval_slot: u64,
+    import_blocks: Vec<PlanBlockImportWire>,
+    attestation_sources: Vec<PlanAttestationSourceWire>,
     source_block_slot: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PlanBlockImportWire {
+    slot: u64,
+    root: String,
+    canonical: bool,
+}
+
+#[derive(Deserialize)]
+struct PlanAttestationSourceWire {
+    slot: u64,
+    max_attestation_slot: Option<u64>,
 }
 
 pub async fn fetch_attestation_plan(
@@ -51,16 +90,69 @@ pub async fn fetch_attestation_plan(
         .await
         .context("failed to decode attestation plan JSON")?;
 
-    Ok(plan_response
-        .entries
-        .into_iter()
-        .map(|entry| {
-            (
-                Slot::new(entry.sim_slot),
-                entry.source_block_slot.map(Slot::new),
+    let version = plan_response
+        .version
+        .context("attestation plan response is missing version")?;
+    if version != 2 {
+        bail!(
+            "unsupported attestation plan version {}; expected 2",
+            version
+        );
+    }
+
+    let mut plan = HashMap::with_capacity(plan_response.entries.len());
+    for entry in plan_response.entries {
+        let sim_slot = Slot::new(entry.sim_slot);
+        if plan
+            .insert(
+                sim_slot,
+                PlanEntry {
+                    eval_slot: Slot::new(entry.eval_slot),
+                    import_blocks: entry
+                        .import_blocks
+                        .into_iter()
+                        .map(|block| {
+                            Ok(PlanBlockImport {
+                                slot: Slot::new(block.slot),
+                                root: parse_root(&block.root).with_context(|| {
+                                    format!(
+                                        "invalid import block root for sim_slot {} slot {}",
+                                        sim_slot, block.slot
+                                    )
+                                })?,
+                                canonical: block.canonical,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    attestation_sources: entry
+                        .attestation_sources
+                        .into_iter()
+                        .map(|source| PlanAttestationSource {
+                            slot: Slot::new(source.slot),
+                            max_attestation_slot: source.max_attestation_slot.map(Slot::new),
+                        })
+                        .collect(),
+                    source_block_slot: entry.source_block_slot.map(Slot::new),
+                },
             )
-        })
-        .collect())
+            .is_some()
+        {
+            bail!("attestation plan contains duplicate sim_slot {}", sim_slot);
+        }
+    }
+
+    Ok(plan)
+}
+
+fn parse_root(root: &str) -> Result<Hash256> {
+    let root = root.strip_prefix("0x").unwrap_or(root);
+    if root.len() != 64 {
+        bail!(
+            "expected 32-byte root hex string, got {} hex chars",
+            root.len()
+        );
+    }
+    Hash256::from_str(root).map_err(|e| anyhow::anyhow!("invalid root hex: {:?}", e))
 }
 
 fn trim_body(body: &str) -> &str {

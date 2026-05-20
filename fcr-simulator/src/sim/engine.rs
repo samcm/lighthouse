@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,11 +17,11 @@ use store::{HotColdDB, StoreConfig};
 use task_executor::test_utils::TestRuntime;
 use tracing::{debug, info, warn};
 use types::{
-    BeaconState, BlockImportSource, ChainSpec, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock,
-    Slot,
+    BeaconState, BlockImportSource, ChainSpec, EthSpec, Hash256, IndexedAttestation,
+    MainnetEthSpec, SignedBeaconBlock, Slot,
 };
 
-use crate::config::{Config, Network};
+use crate::config::{AttestationSourceMode, Config, Network};
 use crate::http::{AttestationPlan, BeaconFetcher, fetch_attestation_plan};
 use crate::output::{OutputWriter, SlotResult};
 
@@ -30,6 +31,9 @@ pub struct Engine {
     chain: Arc<BeaconChain<T>>,
     block_fetcher: BeaconFetcher,
     block_cache: HashMap<Slot, Option<SignedBeaconBlock<MainnetEthSpec>>>,
+    /// Roots that returned 404 from the orchestrator block-by-root endpoint
+    /// (orphan not in any archive). Memoized so we don't re-fetch them every slot.
+    missing_orphan_roots: RefCell<HashSet<Hash256>>,
     plan: AttestationPlan,
     output: OutputWriter,
     config: EngineConfig,
@@ -41,6 +45,8 @@ struct EngineConfig {
     start_slot: Slot,
     end_slot: Slot,
     warmup_start_slot: Slot,
+    attestation_source_mode: AttestationSourceMode,
+    lookahead_cap: u64,
 }
 
 impl Engine {
@@ -120,12 +126,15 @@ impl Engine {
             chain,
             block_fetcher,
             block_cache: HashMap::new(),
+            missing_orphan_roots: RefCell::new(HashSet::new()),
             plan,
             output,
             config: EngineConfig {
                 start_slot,
                 end_slot,
                 warmup_start_slot,
+                attestation_source_mode: config.attestation_source_mode(),
+                lookahead_cap: config.lookahead_cap(),
             },
             _runtime: runtime,
             _db_dir: db_dir,
@@ -152,19 +161,21 @@ impl Engine {
                     .with_context(|| format!("failed to process block at slot {}", slot))?;
             }
 
-            let source_slot = self.plan.get(&slot).copied().flatten();
-            let num_attestations_injected = if let Some(source_block_slot) = source_slot {
-                self.inject_attestations_from_source_block(slot, source_block_slot)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to inject attestations for sim slot {} from source block {}",
-                            slot, source_block_slot
-                        )
-                    })?
-            } else {
-                0
-            };
+            let source_slots = self.attestation_source_slots(slot).await?;
+            let source_slot = source_slots.first().copied();
+            let num_attestations_injected = self
+                .inject_attestations_from_source_blocks(slot, &source_slots)
+                .await
+                .with_context(|| {
+                    let source_slots = source_slots
+                        .iter()
+                        .map(|slot| slot.as_u64())
+                        .collect::<Vec<_>>();
+                    format!(
+                        "failed to inject attestations for sim slot {} from source blocks {:?}",
+                        slot, source_slots
+                    )
+                })?;
 
             let fcr_eval_start = Instant::now();
             self.chain.recompute_head_at_slot(slot + 1).await;
@@ -212,6 +223,46 @@ impl Engine {
         Ok(block)
     }
 
+    async fn attestation_source_slots(&mut self, sim_slot: Slot) -> Result<Vec<Slot>> {
+        match self.config.attestation_source_mode {
+            AttestationSourceMode::NextNonMissed
+            | AttestationSourceMode::StrictSourceBlockKMinus1 => Ok(self
+                .plan
+                .get(&sim_slot)
+                .copied()
+                .flatten()
+                .into_iter()
+                .collect()),
+            AttestationSourceMode::GreedyLookahead => {
+                self.greedy_lookahead_source_slots(sim_slot).await
+            }
+        }
+    }
+
+    async fn greedy_lookahead_source_slots(&mut self, sim_slot: Slot) -> Result<Vec<Slot>> {
+        let lookahead_cap = self.config.lookahead_cap;
+        let Some(end_slot) = sim_slot.as_u64().checked_add(lookahead_cap) else {
+            return Ok(Vec::new());
+        };
+        let Some(mut source_slot) = sim_slot.as_u64().checked_add(1) else {
+            return Ok(Vec::new());
+        };
+
+        let mut source_slots = Vec::new();
+        loop {
+            let slot = Slot::new(source_slot);
+            if self.get_block_at_slot(slot).await?.is_some() {
+                source_slots.push(slot);
+            }
+            if source_slot == end_slot {
+                break;
+            }
+            source_slot += 1;
+        }
+
+        Ok(source_slots)
+    }
+
     async fn process_block(&self, block: &SignedBeaconBlock<MainnetEthSpec>) -> Result<()> {
         let block_root = block.canonical_root();
         let block_arc = Arc::new(block.clone());
@@ -241,6 +292,20 @@ impl Engine {
         Ok(())
     }
 
+    async fn inject_attestations_from_source_blocks(
+        &mut self,
+        sim_slot: Slot,
+        source_block_slots: &[Slot],
+    ) -> Result<u64> {
+        let mut injected = 0;
+        for source_block_slot in source_block_slots {
+            injected += self
+                .inject_attestations_from_source_block(sim_slot, *source_block_slot)
+                .await?;
+        }
+        Ok(injected)
+    }
+
     async fn inject_attestations_from_source_block(
         &mut self,
         sim_slot: Slot,
@@ -262,8 +327,22 @@ impl Engine {
         let head_state = &head_snapshot.beacon_state;
         let mut ctxt = ConsensusContext::new(source_block_slot);
 
+        // In greedy-lookahead we pull attestations from several future source
+        // blocks, which can carry votes made after the slot FCR is evaluating.
+        // A live node would not have those yet, so drop attestations whose own
+        // slot is past eval_slot. Other source modes already only see votes from
+        // a single source block and are left untouched.
+        let eval_slot = sim_slot + 1;
+        let greedy = matches!(
+            self.config.attestation_source_mode,
+            AttestationSourceMode::GreedyLookahead
+        );
+
         let mut indexed_attestations = Vec::with_capacity(attestation_count);
         for attestation in block.message().body().attestations() {
+            if greedy && attestation.data().slot > eval_slot {
+                continue;
+            }
             match ctxt.get_indexed_attestation(head_state, attestation) {
                 Ok(indexed_ref) => {
                     indexed_attestations.push(indexed_ref.clone_as_indexed_attestation());
@@ -279,19 +358,28 @@ impl Engine {
             return Ok(0);
         }
 
+        // Resolve any attestations referencing roots outside our canonical replay
+        // (orphans / short-lived forks) through the orchestrator beacon API.
+        // eval_slot (declared above) is the slot FCR is evaluated at this
+        // iteration; only blocks that could exist by then are eligible for import.
+        self.import_unknown_referenced_blocks(&indexed_attestations, eval_slot)
+            .await;
+
         let inject_slot = sim_slot + 1;
         let mut fc = self.chain.canonical_head.fork_choice_write_lock();
-        let mut injected = 0u64;
+        let mut injected = 0;
 
         let spec = self.chain.spec.clone();
         for indexed in &indexed_attestations {
+            let data = indexed.data();
+            let target_root = data.target.root;
+
             if let Err(e) = fc.on_attestation(
                 inject_slot,
                 indexed.to_ref(),
                 AttestationFromBlock::True,
                 &spec,
             ) {
-                let target_root = indexed.to_ref().data().target.root;
                 let target_in_fc = fc.proto_array().contains_block(&target_root);
                 let head_root = indexed.to_ref().data().beacon_block_root;
                 let head_in_fc = fc.proto_array().contains_block(&head_root);
@@ -314,6 +402,98 @@ impl Engine {
         }
 
         Ok(injected)
+    }
+
+    /// Walk every attestation's `target.root` and `beacon_block_root`. For any root not
+    /// already in fork choice, fetch it by root through the orchestrator beacon API and
+    /// import it (recursively walking its parent chain up to MAX_ORPHAN_WALK levels) so
+    /// subsequent `on_attestation` calls don't reject the vote with
+    /// UnknownTargetRoot/UnknownHeadBlock.
+    async fn import_unknown_referenced_blocks(
+        &self,
+        indexed_attestations: &[IndexedAttestation<MainnetEthSpec>],
+        eval_slot: Slot,
+    ) {
+        const MAX_ORPHAN_WALK: usize = 16;
+
+        let unknown_roots: HashSet<Hash256> = {
+            let fc = self.chain.canonical_head.fork_choice_read_lock();
+            let proto = fc.proto_array();
+            let missing = self.missing_orphan_roots.borrow();
+            let mut roots = HashSet::new();
+            for att in indexed_attestations {
+                let data = att.data();
+                for root in [data.target.root, data.beacon_block_root] {
+                    if root != Hash256::ZERO
+                        && !proto.contains_block(&root)
+                        && !missing.contains(&root)
+                    {
+                        roots.insert(root);
+                    }
+                }
+            }
+            roots
+        };
+
+        if unknown_roots.is_empty() {
+            return;
+        }
+
+        let mut to_import: Vec<SignedBeaconBlock<MainnetEthSpec>> = Vec::new();
+        let mut seen: HashSet<Hash256> = HashSet::new();
+
+        for root in unknown_roots {
+            let mut current = root;
+            for _depth in 0..MAX_ORPHAN_WALK {
+                let already_known = {
+                    let fc = self.chain.canonical_head.fork_choice_read_lock();
+                    fc.proto_array().contains_block(&current)
+                };
+                if already_known || !seen.insert(current) {
+                    break;
+                }
+                if self.missing_orphan_roots.borrow().contains(&current) {
+                    break;
+                }
+                let block = match self.block_fetcher.fetch_block_by_root(current).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if msg.contains("HTTP 404") {
+                            // Permanently absent (no archive has it); don't retry.
+                            self.missing_orphan_roots.borrow_mut().insert(current);
+                            debug!(?current, "orphan block not in archive");
+                        } else {
+                            // Transient error; leave un-memoized so a later slot can retry.
+                            warn!(?current, error = %msg, "orphan block fetch failed");
+                        }
+                        break;
+                    }
+                };
+                // Don't pull blocks from beyond the slot FCR is evaluating: a live
+                // node would not yet have a block whose slot is after eval_slot.
+                // This prevents greedy-lookahead source blocks from importing
+                // future canonical blocks early.
+                if block.slot() > eval_slot {
+                    break;
+                }
+                let parent_root = block.message().parent_root();
+                to_import.push(block);
+                current = parent_root;
+            }
+        }
+
+        to_import.sort_by_key(|b| b.slot());
+
+        for block in &to_import {
+            let block_root = block.canonical_root();
+            match self.process_block(block).await {
+                Ok(()) => info!(?block_root, slot = %block.slot(), "imported orphan block"),
+                Err(e) => {
+                    warn!(?block_root, error = %format!("{e:#}"), "orphan block import failed")
+                }
+            }
+        }
     }
 
     fn build_slot_result(

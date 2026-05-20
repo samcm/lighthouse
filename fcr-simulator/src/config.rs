@@ -60,9 +60,18 @@ impl Config {
 
         self.required_str(self.beacon_node_url.as_deref(), "--beacon-node-url")?;
         self.required(self.network, "--network")?;
-        self.required(self.attestation_source_mode, "--attestation-source-mode")?;
-        self.required_u64(self.lookahead_cap, "--lookahead-cap")?;
+        let attestation_source_mode =
+            self.required(self.attestation_source_mode, "--attestation-source-mode")?;
+        let lookahead_cap = self.required_u64(self.lookahead_cap, "--lookahead-cap")?;
         self.required_path(self.output.as_deref(), "--output")?;
+
+        if matches!(
+            attestation_source_mode,
+            AttestationSourceMode::NextNonMissed | AttestationSourceMode::GreedyLookahead
+        ) && lookahead_cap == 0
+        {
+            bail!("--lookahead-cap must be greater than zero for {attestation_source_mode:?}");
+        }
 
         if warmup_start_slot > start_slot {
             bail!("--warmup-start-slot must be <= --start-slot");
@@ -107,6 +116,16 @@ impl Config {
             .expect("validated config should include --output")
     }
 
+    pub fn attestation_source_mode(&self) -> AttestationSourceMode {
+        self.attestation_source_mode
+            .expect("validated config should include --attestation-source-mode")
+    }
+
+    pub fn lookahead_cap(&self) -> u64 {
+        self.lookahead_cap
+            .expect("validated config should include --lookahead-cap")
+    }
+
     fn required_str<'a>(&self, value: Option<&'a str>, flag: &str) -> Result<&'a str> {
         value.ok_or_else(|| anyhow::anyhow!("missing required flag {flag}"))
     }
@@ -129,10 +148,12 @@ pub enum Network {
     Mainnet,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AttestationSourceMode {
     #[value(name = "next-non-missed")]
     NextNonMissed,
     #[value(name = "strict-source-block-k-minus-1")]
     StrictSourceBlockKMinus1,
+    #[value(name = "greedy-lookahead")]
+    GreedyLookahead,
 }

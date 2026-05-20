@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,22 +7,24 @@ use beacon_chain::chain_config::ChainConfig;
 use beacon_chain::migrate::MigratorConfig;
 use beacon_chain::test_utils::DiskHarnessType;
 use beacon_chain::{BeaconChain, NotifyExecutionLayer};
+use bls::AggregateSignature;
 use fork_choice::AttestationFromBlock;
 use rand::SeedableRng;
 use slot_clock::{SlotClock, TestingSlotClock};
+use ssz::{BitList, BitVector, Decode};
 use state_processing::ConsensusContext;
+use std::collections::HashMap;
 use store::{HotColdDB, StoreConfig};
 use task_executor::test_utils::TestRuntime;
 use tracing::{debug, info, warn};
 use types::{
-    BeaconState, BlockImportSource, ChainSpec, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock,
+    Attestation, AttestationBase, AttestationData, AttestationElectra, BeaconState,
+    BlockImportSource, ChainSpec, Checkpoint, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock,
     Slot,
 };
 
 use crate::config::{Config, Network};
-use crate::http::{
-    AttestationPlan, BeaconFetcher, PlanAttestationSource, PlanBlockImport, fetch_attestation_plan,
-};
+use crate::http::{BeaconFetcher, PlanAttestation, PlanBlockImport, fetch_slot_instruction};
 use crate::output::{OutputWriter, SlotResult};
 
 type T = DiskHarnessType<MainnetEthSpec>;
@@ -32,7 +33,6 @@ pub struct Engine {
     chain: Arc<BeaconChain<T>>,
     block_fetcher: BeaconFetcher,
     block_cache: HashMap<Slot, Option<SignedBeaconBlock<MainnetEthSpec>>>,
-    plan: AttestationPlan,
     output: OutputWriter,
     config: EngineConfig,
     _runtime: TestRuntime,
@@ -43,6 +43,7 @@ struct EngineConfig {
     start_slot: Slot,
     end_slot: Slot,
     warmup_start_slot: Slot,
+    beacon_node_url: String,
 }
 
 impl Engine {
@@ -99,22 +100,6 @@ impl Engine {
         )
         .context("failed to build BeaconChain")?;
 
-        let plan =
-            fetch_attestation_plan(config.beacon_node_url(), warmup_start_slot + 1, end_slot)
-                .await
-                .context("failed to fetch attestation plan")?;
-
-        let mut sim_slot = warmup_start_slot + 1;
-        while sim_slot < end_slot {
-            if !plan.contains_key(&sim_slot) {
-                bail!(
-                    "attestation plan is missing sim_slot {}; orchestrator served an incomplete plan",
-                    sim_slot
-                );
-            }
-            sim_slot += 1;
-        }
-
         let output =
             OutputWriter::new(config.output()).context("failed to create JSONL output writer")?;
 
@@ -122,12 +107,12 @@ impl Engine {
             chain,
             block_fetcher,
             block_cache: HashMap::new(),
-            plan,
             output,
             config: EngineConfig {
                 start_slot,
                 end_slot,
                 warmup_start_slot,
+                beacon_node_url: config.beacon_node_url().to_string(),
             },
             _runtime: runtime,
             _db_dir: db_dir,
@@ -144,43 +129,42 @@ impl Engine {
 
             self.chain.slot_clock.set_slot(slot.as_u64());
 
-            let plan_entry = self
-                .plan
-                .get(&slot)
-                .cloned()
-                .with_context(|| format!("attestation plan is missing sim_slot {}", slot))?;
+            let instruction = fetch_slot_instruction(
+                &self.config.beacon_node_url,
+                slot,
+                self.config.warmup_start_slot,
+            )
+            .await
+            .with_context(|| format!("failed to fetch slot instruction for sim slot {}", slot))?;
+            if instruction.sim_slot != slot {
+                bail!(
+                    "slot instruction sim_slot mismatch: requested {}, got {}",
+                    slot,
+                    instruction.sim_slot
+                );
+            }
 
             let (has_block, block_root) = self
-                .import_planned_blocks(slot, &plan_entry.import_blocks)
+                .import_planned_blocks(slot, &instruction.import_blocks)
                 .await
                 .with_context(|| {
                     format!("failed to import planned blocks for sim slot {}", slot)
                 })?;
 
-            let source_slot = plan_entry.source_block_slot.or_else(|| {
-                plan_entry
-                    .attestation_sources
-                    .first()
-                    .map(|source| source.slot)
-            });
             let num_attestations_injected = self
-                .inject_attestations_from_sources(slot, &plan_entry.attestation_sources)
+                .inject_attestations(slot, &instruction.attestations)
                 .await
                 .with_context(|| {
-                    let source_slots = plan_entry
-                        .attestation_sources
-                        .iter()
-                        .map(|source| source.slot.as_u64())
-                        .collect::<Vec<_>>();
                     format!(
-                        "failed to inject attestations for sim slot {} from source blocks {:?}",
-                        slot, source_slots
+                        "failed to inject {} planned attestations for sim slot {}",
+                        instruction.attestations.len(),
+                        slot
                     )
                 })?;
 
             let fcr_eval_start = Instant::now();
             self.chain
-                .recompute_head_at_slot(plan_entry.eval_slot)
+                .recompute_head_at_slot(instruction.eval_slot)
                 .await;
             let fcr_eval_duration_us = micros_since(fcr_eval_start);
 
@@ -189,7 +173,7 @@ impl Engine {
                     slot,
                     has_block,
                     block_root,
-                    source_slot,
+                    None,
                     num_attestations_injected,
                     fcr_eval_duration_us,
                 );
@@ -260,6 +244,15 @@ impl Engine {
             }
 
             if let Err(e) = self.process_block(&block).await {
+                if is_duplicate_import_error(&e) {
+                    warn!(
+                        block_root = ?import.root,
+                        slot = %import.slot,
+                        canonical = import.canonical,
+                        "planned block was already known; skipping duplicate import"
+                    );
+                    continue;
+                }
                 if import.canonical {
                     return Err(e).with_context(|| {
                         format!("failed to process canonical block at {}", sim_slot)
@@ -337,50 +330,23 @@ impl Engine {
         Ok(())
     }
 
-    async fn inject_attestations_from_sources(
+    async fn inject_attestations(
         &mut self,
         sim_slot: Slot,
-        sources: &[PlanAttestationSource],
+        attestations: &[PlanAttestation],
     ) -> Result<u64> {
-        let mut injected = 0;
-        for source in sources {
-            injected += self
-                .inject_attestations_from_source(sim_slot, source)
-                .await?;
-        }
-        Ok(injected)
-    }
-
-    async fn inject_attestations_from_source(
-        &mut self,
-        sim_slot: Slot,
-        source: &PlanAttestationSource,
-    ) -> Result<u64> {
-        let source_block_slot = source.slot;
-        let Some(block) = self.get_block_at_slot(source_block_slot).await? else {
-            bail!(
-                "attestation plan referenced missing source block at slot {}",
-                source_block_slot
-            );
-        };
-
-        let attestation_count = block.message().body().attestations_len();
-        if attestation_count == 0 {
+        if attestations.is_empty() {
             return Ok(0);
         }
 
         let head_snapshot = self.chain.head_snapshot();
         let head_state = &head_snapshot.beacon_state;
-        let mut ctxt = ConsensusContext::new(source_block_slot);
+        let mut ctxt = ConsensusContext::new(sim_slot);
 
-        let mut indexed_attestations = Vec::with_capacity(attestation_count);
-        for attestation in block.message().body().attestations() {
-            if let Some(max_slot) = source.max_attestation_slot {
-                if attestation.data().slot > max_slot {
-                    continue;
-                }
-            }
-            match ctxt.get_indexed_attestation(head_state, attestation) {
+        let mut indexed_attestations = Vec::with_capacity(attestations.len());
+        for planned_attestation in attestations {
+            let attestation = self.build_attestation(planned_attestation)?;
+            match ctxt.get_indexed_attestation(head_state, attestation.to_ref()) {
                 Ok(indexed_ref) => {
                     indexed_attestations.push(indexed_ref.clone_as_indexed_attestation());
                 }
@@ -417,7 +383,7 @@ impl Engine {
                 warn!(
                     error = ?e,
                     %sim_slot,
-                    %source_block_slot,
+                    attestation_slot = %data.slot,
                     ?target_root,
                     target_in_fc,
                     ?head_root,
@@ -432,6 +398,66 @@ impl Engine {
         }
 
         Ok(injected)
+    }
+
+    fn build_attestation(&self, planned: &PlanAttestation) -> Result<Attestation<MainnetEthSpec>> {
+        let data = AttestationData {
+            slot: planned.data.slot,
+            index: planned.data.index,
+            beacon_block_root: planned.data.beacon_block_root,
+            source: Checkpoint {
+                epoch: planned.data.source.epoch,
+                root: planned.data.source.root,
+            },
+            target: Checkpoint {
+                epoch: planned.data.target.epoch,
+                root: planned.data.target.root,
+            },
+        };
+
+        let fork = self
+            .chain
+            .spec
+            .fork_name_at_slot::<MainnetEthSpec>(planned.data.slot);
+        if fork.electra_enabled() {
+            let committee_bits = planned
+                .committee_bits
+                .as_deref()
+                .context("electra attestation is missing committee_bits")?;
+            Ok(Attestation::Electra(AttestationElectra {
+                aggregation_bits:
+                    BitList::<<MainnetEthSpec as EthSpec>::MaxValidatorsPerSlot>::from_ssz_bytes(
+                        &planned.aggregation_bits,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to decode electra aggregation_bits: {:?}", e)
+                    })?,
+                data,
+                signature: AggregateSignature::infinity(),
+                committee_bits:
+                    BitVector::<<MainnetEthSpec as EthSpec>::MaxCommitteesPerSlot>::from_ssz_bytes(
+                        committee_bits,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to decode electra committee_bits: {:?}", e)
+                    })?,
+            }))
+        } else {
+            Ok(Attestation::Base(
+                AttestationBase {
+                    aggregation_bits: BitList::<
+                        <MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee,
+                    >::from_ssz_bytes(
+                        &planned.aggregation_bits
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to decode base aggregation_bits: {:?}", e)
+                    })?,
+                    data,
+                    signature: AggregateSignature::infinity(),
+                },
+            ))
+        }
     }
 
     fn build_slot_result(
@@ -565,4 +591,9 @@ fn build_chain(
 
 fn micros_since(start: Instant) -> u64 {
     start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn is_duplicate_import_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("DuplicateFullyImported") || message.contains("DuplicateImportStatusUnknown")
 }

@@ -31,11 +31,11 @@ pub struct Config {
     #[arg(long, default_value_t = 25)]
     pub byzantine_threshold: u64,
 
-    /// Accepted for orchestrator compatibility; execution uses the v2 plan.
+    /// Accepted for orchestrator compatibility; execution is driven by per-slot instructions.
     #[arg(long)]
     pub attestation_source_mode: Option<String>,
 
-    /// Accepted for orchestrator compatibility; execution uses the v2 plan.
+    /// Accepted for orchestrator compatibility; execution is driven by per-slot instructions.
     #[arg(long)]
     pub lookahead_cap: Option<u64>,
 

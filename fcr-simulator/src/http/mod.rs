@@ -1,8 +1,8 @@
 pub mod fetcher;
-pub mod plan;
+pub mod slot;
 
 pub use fetcher::BeaconFetcher;
-pub use plan::{AttestationPlan, PlanAttestationSource, PlanBlockImport, fetch_attestation_plan};
+pub use slot::{PlanAttestation, PlanBlockImport, fetch_slot_instruction};
 
 use anyhow::{Context, Result};
 

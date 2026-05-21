@@ -540,10 +540,9 @@ fn build_chain(
         &cold_path,
         &blobs_path,
         |_, _, _| Ok(()),
-        StoreConfig {
-            skip_disk_writes: true,
-            ..StoreConfig::default()
-        },
+        // The store migrator builds its pruning DAG from hot state summaries on disk.
+        // Keep disk writes enabled so finalized hot states can be migrated and pruned.
+        StoreConfig::default(),
         spec_arc.clone(),
     )
     .map_err(|e| anyhow::anyhow!("failed to create disk store: {:?}", e))?;

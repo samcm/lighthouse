@@ -101,10 +101,8 @@ fn engine_version() -> &'static str {
 }
 
 fn build_flags() -> Vec<&'static str> {
-    let mut flags = Vec::new();
-
-    #[cfg(feature = "fake_crypto")]
-    flags.push("fake_crypto");
-
-    flags
+    vec![
+        #[cfg(feature = "fake_crypto")]
+        "fake_crypto",
+    ]
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use beacon_chain::builder::BeaconChainBuilder;
@@ -28,6 +28,8 @@ use crate::http::{BeaconFetcher, PlanAttestation, PlanBlockImport, fetch_slot_in
 use crate::output::{OutputWriter, SlotResult};
 
 type T = DiskHarnessType<MainnetEthSpec>;
+
+const FCR_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Engine {
     chain: Arc<BeaconChain<T>>,
@@ -123,9 +125,22 @@ impl Engine {
         let mut slot = self.config.warmup_start_slot + 1;
         let mut total_recorded = 0u64;
         let run_start = Instant::now();
+        let recording_slots = self
+            .config
+            .end_slot
+            .as_u64()
+            .saturating_sub(self.config.start_slot.as_u64());
+        let mut recording_start: Option<Instant> = None;
+        let mut last_progress_at: Option<Instant> = None;
+        let mut last_progress_recorded = 0u64;
 
         while slot < self.config.end_slot {
             let is_recording = slot >= self.config.start_slot;
+            if is_recording && recording_start.is_none() {
+                let now = Instant::now();
+                recording_start = Some(now);
+                last_progress_at = Some(now);
+            }
 
             self.chain.slot_clock.set_slot(slot.as_u64());
 
@@ -180,12 +195,47 @@ impl Engine {
                 total_recorded += 1;
                 self.output.write(&result)?;
                 self.output.flush_if_needed(total_recorded)?;
+
+                let now = Instant::now();
+                if last_progress_at
+                    .map(|last| now.duration_since(last) >= FCR_PROGRESS_INTERVAL)
+                    .unwrap_or(false)
+                    && total_recorded < recording_slots
+                {
+                    log_fcr_progress(
+                        self.config.start_slot,
+                        self.config.end_slot,
+                        slot,
+                        total_recorded,
+                        recording_slots,
+                        recording_start,
+                        last_progress_at,
+                        last_progress_recorded,
+                        now,
+                        false,
+                    );
+                    last_progress_at = Some(now);
+                    last_progress_recorded = total_recorded;
+                }
             }
 
             slot += 1;
         }
 
         self.output.flush()?;
+
+        log_fcr_progress(
+            self.config.start_slot,
+            self.config.end_slot,
+            Slot::new(self.config.end_slot.as_u64().saturating_sub(1)),
+            total_recorded,
+            recording_slots,
+            recording_start,
+            last_progress_at,
+            last_progress_recorded,
+            Instant::now(),
+            true,
+        );
 
         info!(
             total_slots = total_recorded,
@@ -514,6 +564,76 @@ impl Engine {
             is_missed_slot: !has_block,
             fcr_eval_duration_us,
         }
+    }
+}
+
+fn log_fcr_progress(
+    start_slot: Slot,
+    end_slot: Slot,
+    sim_slot: Slot,
+    slots_processed: u64,
+    total_slots: u64,
+    recording_start: Option<Instant>,
+    last_progress_at: Option<Instant>,
+    last_progress_slots: u64,
+    now: Instant,
+    is_final: bool,
+) {
+    let percent_complete = if total_slots == 0 {
+        100.0
+    } else {
+        (slots_processed as f64 / total_slots as f64) * 100.0
+    };
+    let interval_secs = last_progress_at
+        .map(|last| now.duration_since(last).as_secs_f64())
+        .unwrap_or(0.0);
+    let interval_slots = slots_processed.saturating_sub(last_progress_slots);
+    let cumulative_secs = recording_start
+        .map(|start| now.duration_since(start).as_secs_f64())
+        .unwrap_or(0.0);
+    let cumulative_rate = slots_per_sec(slots_processed, cumulative_secs);
+    let remaining_slots = total_slots.saturating_sub(slots_processed);
+    let eta_secs = if !is_final && cumulative_rate > 0.0 {
+        (remaining_slots as f64 / cumulative_rate) as u64
+    } else {
+        0
+    };
+
+    info!(
+        tag = "fcr-progress",
+        %start_slot,
+        %end_slot,
+        %sim_slot,
+        slots_processed,
+        total_slots,
+        percent_complete = format!("{:.2}", percent_complete),
+        interval_slots_per_sec = format!("{:.2}", slots_per_sec(interval_slots, interval_secs)),
+        cumulative_slots_per_sec = format!("{:.2}", cumulative_rate),
+        eta_secs,
+        eta = format_eta(eta_secs),
+        final = is_final,
+        "fcr-progress"
+    );
+}
+
+fn format_eta(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{}h{:02}m", h, m)
+    } else if m > 0 {
+        format!("{}m{:02}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+fn slots_per_sec(slots: u64, seconds: f64) -> f64 {
+    if seconds > 0.0 {
+        slots as f64 / seconds
+    } else {
+        0.0
     }
 }
 

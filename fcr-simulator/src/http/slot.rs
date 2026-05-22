@@ -23,9 +23,10 @@ pub struct PlanBlockImport {
 
 #[derive(Clone)]
 pub struct PlanAttestation {
-    pub aggregation_bits: Vec<u8>,
+    pub aggregation_bits: Option<Vec<u8>>,
     pub committee_bits: Option<Vec<u8>>,
     pub data: PlanAttestationData,
+    pub attesting_indices: Option<Vec<u64>>,
 }
 
 #[derive(Clone)]
@@ -66,9 +67,10 @@ struct PlanBlockImportWire {
 
 #[derive(Deserialize)]
 struct PlanAttestationWire {
-    aggregation_bits: String,
+    aggregation_bits: Option<String>,
     committee_bits: Option<String>,
     data: PlanAttestationDataWire,
+    attesting_indices: Option<Vec<u64>>,
 }
 
 #[derive(Deserialize)]
@@ -165,8 +167,16 @@ pub async fn fetch_slot_instruction(
 }
 
 fn parse_attestation(attestation: PlanAttestationWire) -> Result<PlanAttestation> {
+    if attestation.aggregation_bits.is_none() && attestation.attesting_indices.is_none() {
+        bail!("attestation is missing aggregation_bits or attesting_indices");
+    }
+
     Ok(PlanAttestation {
-        aggregation_bits: parse_hex_bytes(&attestation.aggregation_bits)
+        aggregation_bits: attestation
+            .aggregation_bits
+            .as_deref()
+            .map(parse_hex_bytes)
+            .transpose()
             .context("invalid attestation aggregation_bits")?,
         committee_bits: attestation
             .committee_bits
@@ -175,6 +185,7 @@ fn parse_attestation(attestation: PlanAttestationWire) -> Result<PlanAttestation
             .transpose()
             .context("invalid attestation committee_bits")?,
         data: parse_attestation_data(attestation.data)?,
+        attesting_indices: attestation.attesting_indices,
     })
 }
 

@@ -19,8 +19,8 @@ use task_executor::test_utils::TestRuntime;
 use tracing::{debug, info, warn};
 use types::{
     Attestation, AttestationBase, AttestationData, AttestationElectra, BeaconState,
-    BlockImportSource, ChainSpec, Checkpoint, EthSpec, Hash256, MainnetEthSpec, SignedBeaconBlock,
-    Slot,
+    BlockImportSource, ChainSpec, Checkpoint, EthSpec, Hash256, IndexedAttestation,
+    IndexedAttestationBase, IndexedAttestationElectra, MainnetEthSpec, SignedBeaconBlock, Slot,
 };
 
 use crate::config::{Config, Network};
@@ -389,23 +389,37 @@ impl Engine {
             return Ok(0);
         }
 
-        let head_snapshot = self.chain.head_snapshot();
-        let head_state = &head_snapshot.beacon_state;
-        let mut ctxt = ConsensusContext::new(sim_slot);
-
         let mut indexed_attestations = Vec::with_capacity(attestations.len());
-        for planned_attestation in attestations {
-            let attestation = self.build_attestation(planned_attestation)?;
-            match ctxt.get_indexed_attestation(head_state, attestation.to_ref()) {
-                Ok(indexed_ref) => {
-                    indexed_attestations.push(indexed_ref.clone_as_indexed_attestation());
+        let has_wire_attestations = attestations
+            .iter()
+            .any(|planned_attestation| planned_attestation.attesting_indices.is_none());
+
+        if has_wire_attestations {
+            let head_snapshot = self.chain.head_snapshot();
+            let head_state = &head_snapshot.beacon_state;
+            let mut ctxt = ConsensusContext::new(sim_slot);
+
+            for planned_attestation in attestations {
+                if planned_attestation.attesting_indices.is_some() {
+                    indexed_attestations.push(self.build_indexed_attestation(planned_attestation)?);
+                    continue;
                 }
-                Err(e) => {
-                    debug!(error = ?e, "Failed to get indexed attestation");
+
+                let attestation = self.build_attestation(planned_attestation)?;
+                match ctxt.get_indexed_attestation(head_state, attestation.to_ref()) {
+                    Ok(indexed_ref) => {
+                        indexed_attestations.push(indexed_ref.clone_as_indexed_attestation());
+                    }
+                    Err(e) => {
+                        debug!(error = ?e, "Failed to get indexed attestation");
+                    }
                 }
             }
+        } else {
+            for planned_attestation in attestations {
+                indexed_attestations.push(self.build_indexed_attestation(planned_attestation)?);
+            }
         }
-        drop(head_snapshot);
 
         if indexed_attestations.is_empty() {
             return Ok(0);
@@ -443,15 +457,51 @@ impl Engine {
                     "Failed to inject attestation"
                 );
             } else {
-                injected += 1;
+                injected += indexed.attesting_indices_len() as u64;
             }
         }
 
         Ok(injected)
     }
 
-    fn build_attestation(&self, planned: &PlanAttestation) -> Result<Attestation<MainnetEthSpec>> {
-        let data = AttestationData {
+    fn build_indexed_attestation(
+        &self,
+        planned: &PlanAttestation,
+    ) -> Result<IndexedAttestation<MainnetEthSpec>> {
+        let mut attesting_indices = planned
+            .attesting_indices
+            .clone()
+            .context("indexed attestation is missing attesting_indices")?;
+        attesting_indices.sort_unstable();
+        attesting_indices.dedup();
+
+        let data = self.build_attestation_data(planned);
+        let fork = self
+            .chain
+            .spec
+            .fork_name_at_slot::<MainnetEthSpec>(planned.data.slot);
+
+        if fork.electra_enabled() {
+            Ok(IndexedAttestation::Electra(IndexedAttestationElectra {
+                attesting_indices: attesting_indices
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("invalid electra attesting_indices: {:?}", e))?,
+                data,
+                signature: AggregateSignature::infinity(),
+            }))
+        } else {
+            Ok(IndexedAttestation::Base(IndexedAttestationBase {
+                attesting_indices: attesting_indices
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("invalid base attesting_indices: {:?}", e))?,
+                data,
+                signature: AggregateSignature::infinity(),
+            }))
+        }
+    }
+
+    fn build_attestation_data(&self, planned: &PlanAttestation) -> AttestationData {
+        AttestationData {
             slot: planned.data.slot,
             index: planned.data.index,
             beacon_block_root: planned.data.beacon_block_root,
@@ -463,8 +513,11 @@ impl Engine {
                 epoch: planned.data.target.epoch,
                 root: planned.data.target.root,
             },
-        };
+        }
+    }
 
+    fn build_attestation(&self, planned: &PlanAttestation) -> Result<Attestation<MainnetEthSpec>> {
+        let data = self.build_attestation_data(planned);
         let fork = self
             .chain
             .spec
@@ -477,7 +530,10 @@ impl Engine {
             Ok(Attestation::Electra(AttestationElectra {
                 aggregation_bits:
                     BitList::<<MainnetEthSpec as EthSpec>::MaxValidatorsPerSlot>::from_ssz_bytes(
-                        &planned.aggregation_bits,
+                        planned
+                            .aggregation_bits
+                            .as_deref()
+                            .context("attestation is missing aggregation_bits")?,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("failed to decode electra aggregation_bits: {:?}", e)
@@ -498,7 +554,10 @@ impl Engine {
                     aggregation_bits: BitList::<
                         <MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee,
                     >::from_ssz_bytes(
-                        &planned.aggregation_bits
+                        planned
+                            .aggregation_bits
+                            .as_deref()
+                            .context("attestation is missing aggregation_bits")?,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("failed to decode base aggregation_bits: {:?}", e)

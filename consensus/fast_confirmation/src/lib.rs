@@ -440,6 +440,16 @@ impl FastConfirmationRule {
         let is_epoch_start = is_start_slot_at_epoch::<E>(current_slot);
         let mut confirmed_root = self.confirmed_root;
 
+        debug!(
+            target: "beacon_chain::fast_confirmation",
+            head_root = %head_root,
+            head_slot = %self.block_slot(head_root, proto_array).unwrap_or_default(),
+            current_slot = %current_slot,
+            existing_confirmed_root = %confirmed_root,
+            is_epoch_start = is_epoch_start,
+            "FCR get_latest_confirmed: entry"
+        );
+
         // Revert to finalized if the confirmed block is older than the previous epoch, is off
         // the canonical chain, or (at an epoch start) its chain can't be re-confirmed.
         let confirmed_epoch_too_old = self
@@ -529,6 +539,16 @@ impl FastConfirmationRule {
         if confirmed_root != pre_advance_root {
             metrics::inc_counter(&metrics::FCR_ADVANCE);
         }
+
+        debug!(
+            target: "beacon_chain::fast_confirmation",
+            current_slot = %current_slot,
+            revert_reason = chain_unsafe_reason.unwrap_or("none"),
+            pre_advance_root = %pre_advance_root,
+            advanced = confirmed_root != pre_advance_root,
+            final_confirmed_root = %confirmed_root,
+            "FCR get_latest_confirmed: exit"
+        );
 
         Ok(confirmed_root)
     }
@@ -637,6 +657,8 @@ impl FastConfirmationRule {
                     proto_array,
                     votes,
                     equivocating_indices,
+                    "phase3_confirm_loop1",
+                    "current",
                 )? {
                     break;
                 }
@@ -679,6 +701,8 @@ impl FastConfirmationRule {
                     proto_array,
                     votes,
                     equivocating_indices,
+                    "phase3_confirm_loop2",
+                    "current",
                 )? {
                     break;
                 }
@@ -775,6 +799,15 @@ impl FastConfirmationRule {
         )?;
 
         let chain_roots = self.get_ancestor_roots(confirmed_root, start_root, proto_array)?;
+        debug!(
+            target: "beacon_chain::fast_confirmation",
+            start_root = %start_root,
+            confirmed_root = %confirmed_root,
+            observed_justified_root = %observed_jcp.root,
+            observed_justified_epoch = %observed_jcp.epoch,
+            chain_roots_checked = chain_roots.len(),
+            "FCR is_confirmed_chain_safe: rechecking confirmed chain"
+        );
         for root in &chain_roots {
             let score = *precomputed_scores
                 .get(root)
@@ -787,7 +820,17 @@ impl FastConfirmationRule {
                 proto_array,
                 votes,
                 equivocating_indices,
+                "phase1_recheck",
+                "previous",
             )? {
+                debug!(
+                    target: "beacon_chain::fast_confirmation",
+                    start_root = %confirmed_root,
+                    observed_justified_root = %observed_jcp.root,
+                    observed_justified_epoch = %observed_jcp.epoch,
+                    failing_root = %root,
+                    "FCR is_confirmed_chain_safe: first failing root on confirmed chain"
+                );
                 return Ok(Some("unconfirmed_block"));
             }
         }
@@ -1361,16 +1404,27 @@ impl FastConfirmationRule {
         // root prefix for cheap hashing; the stored full root disambiguates collisions.
         let mut memo: FastMap<(Hash256, Option<usize>)> = FastMap::default();
 
+        // Diagnostic counters (logging only, no effect on the computed scores).
+        let mut excl_zero_root = 0u64;
+        let mut excl_equivocating = 0u64;
+        let mut excl_zero_balance = 0u64;
+        let mut excl_unknown_root = 0u64;
+        let mut contributors = 0u64;
+        let mut contributed_weight = 0u64;
+
         for (val_idx, vote) in votes.iter().enumerate() {
             let vote_root = vote.current_root();
             if vote_root.is_zero() {
+                excl_zero_root = excl_zero_root.saturating_add(1);
                 continue;
             }
             if equivocating_indices.contains(&(val_idx as u64)) {
+                excl_equivocating = excl_equivocating.saturating_add(1);
                 continue;
             }
             let balance = balance_source.unslashed_balance(val_idx);
             if balance == 0 {
+                excl_zero_balance = excl_zero_balance.saturating_add(1);
                 continue;
             }
 
@@ -1410,8 +1464,28 @@ impl FastConfirmationRule {
 
             if let Some(pos) = pos {
                 score_at_position[pos] = score_at_position[pos].saturating_add(balance);
+                contributors = contributors.saturating_add(1);
+                contributed_weight = contributed_weight.saturating_add(balance);
+            } else {
+                excl_unknown_root = excl_unknown_root.saturating_add(1);
             }
         }
+
+        debug!(
+            target: "beacon_chain::fast_confirmation",
+            chain_tip = %chain_tip,
+            terminal_root = %terminal_root,
+            chain_len = chain_len,
+            balance_epoch = %balance_source.checkpoint.epoch,
+            total_active_balance = balance_source.total_active_balance,
+            contributors = contributors,
+            contributed_weight = contributed_weight,
+            excl_zero_root = excl_zero_root,
+            excl_unknown_root = excl_unknown_root,
+            excl_equivocating = excl_equivocating,
+            excl_zero_balance = excl_zero_balance,
+            "FCR precompute_chain_attestation_scores"
+        );
 
         // Suffix sum: a vote covering position j also covers all ancestors at positions 0..j.
         // score[k] = Σ score_at_position[j] for j ∈ [k, chain_len)
@@ -1441,13 +1515,30 @@ impl FastConfirmationRule {
         proto_array: &ProtoArray,
         votes: &[VoteTracker],
         equivocating_indices: &BTreeSet<u64>,
+        phase: &'static str,
+        balance_label: &'static str,
     ) -> Result<bool, Error> {
         if self.is_optimistic_or_invalid(block_root, proto_array) {
+            debug!(
+                target: "beacon_chain::fast_confirmation",
+                phase = phase,
+                balance_source = balance_label,
+                block_root = %block_root,
+                "FCR is_one_confirmed: block optimistic/invalid, not confirmed"
+            );
             return Ok(false);
         }
 
         let block_slot = self.block_slot(block_root, proto_array)?;
         let Some(parent_root) = self.parent_root(block_root, proto_array) else {
+            debug!(
+                target: "beacon_chain::fast_confirmation",
+                phase = phase,
+                balance_source = balance_label,
+                block_root = %block_root,
+                block_slot = %block_slot,
+                "FCR is_one_confirmed: block has no parent, not confirmed"
+            );
             return Ok(false);
         };
         let parent_slot = self.block_slot(parent_root, proto_array)?;
@@ -1487,7 +1578,26 @@ impl FastConfirmationRule {
             0
         };
 
-        Ok(support > safety_threshold)
+        let confirmed = support > safety_threshold;
+        debug!(
+            target: "beacon_chain::fast_confirmation",
+            phase = phase,
+            balance_source = balance_label,
+            confirmed = confirmed,
+            block_root = %block_root,
+            block_slot = %block_slot,
+            support = support,
+            maximum_support = maximum_support,
+            proposer_score = proposer_score,
+            support_discount = support_discount,
+            adversarial_weight = adversarial_weight,
+            safety_threshold = safety_threshold,
+            balance_epoch = %balance_source.checkpoint.epoch,
+            total_active_balance = balance_source.total_active_balance,
+            "FCR is_one_confirmed"
+        );
+
+        Ok(confirmed)
     }
 }
 

@@ -834,6 +834,24 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         .as_u64()
                         .saturating_sub(balance_epoch.as_u64());
                     metrics::set_gauge(&fcr_metrics::FCR_BALANCE_SOURCE_AGE_EPOCHS, age as i64);
+
+                    debug!(
+                        target: "beacon_chain::fast_confirmation",
+                        current_slot = %fcr_current_slot,
+                        head_root = %head_root,
+                        head_slot = %new_head_proto_block.slot,
+                        confirmed_root_changed = confirmed_root_changed,
+                        old_confirmed_root = %old_confirmed,
+                        new_confirmed_root = %fcr.confirmed_root,
+                        finalized_root = %finalized_cp.root,
+                        finalized_epoch = %finalized_cp.epoch,
+                        justified_root = %fork_choice_read_lock.justified_checkpoint().root,
+                        justified_epoch = %fork_choice_read_lock.justified_checkpoint().epoch,
+                        unrealized_justified_root = %unrealized_justified_cp.root,
+                        unrealized_justified_epoch = %unrealized_justified_cp.epoch,
+                        queued_attestations = fork_choice_read_lock.queued_attestations().len(),
+                        "FCR on_fast_confirmation callsite"
+                    );
                 }
             }
         }
